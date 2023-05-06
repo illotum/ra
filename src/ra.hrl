@@ -20,6 +20,8 @@
 -type ra_index() :: non_neg_integer().
 %% Section 5.3.
 -type ra_term() :: non_neg_integer().
+%% Section 4.2.1
+-type ra_replication_round() :: non_neg_integer().
 
 %% tuple form of index and term
 -type ra_idxterm() :: {ra_index(), ra_term()}.
@@ -44,6 +46,19 @@
                           suspended |
                           disconnected.
 
+%% A peer can be one of:
+%%
+%% - Voter, standard quorum member.
+%% - Nonvoter, node does not participate in elections or consensus voting.
+%% - Staging, node is a temporary nonvoter, and will be automatically promoted
+%%            if it proves to be fast enough to stay up to dat with teh leader.
+-type ra_voter() :: yes | no | {staging, staging_status()}.
+
+%% For staging nodes we measure current round, target index and the timestamp of its start.
+%% If the node reaches target index and the ∂T is less than the election timeout, the node is
+%% considered eligible to become a voter.
+-type staging_status() :: {ra_replication_round(), ra_index(), integer()}.
+
 -type ra_peer_state() :: #{next_index := non_neg_integer(),
                            match_index := non_neg_integer(),
                            query_index := non_neg_integer(),
@@ -52,7 +67,9 @@
                            commit_index_sent := non_neg_integer(),
                            %% indicates that a snapshot is being sent
                            %% to the peer
-                           status := ra_peer_status()}.
+                           status := ra_peer_status(),
+                           %% whether the peer is part of the consensus
+                           voter := ra_voter()}.
 
 -type ra_cluster() :: #{ra_server_id() => ra_peer_state()}.
 

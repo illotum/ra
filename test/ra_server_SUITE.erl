@@ -2593,7 +2593,8 @@ new_peer() ->
       match_index => 0,
       query_index => 0,
       commit_index_sent => 0,
-      status => normal}.
+      status => normal,
+      voter => yes}.
 
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
