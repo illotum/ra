@@ -41,6 +41,7 @@ all() ->
      follower_machine_version,
      follower_install_snapshot_machine_version,
      leader_server_join,
+     leader_server_maybe_join,
      leader_server_leave,
      leader_is_removed,
      follower_cluster_change,
@@ -1310,12 +1311,12 @@ leader_server_join(_Config) ->
       #append_entries_rpc{entries =
                           [_, _, _, {4, 5, {'$ra_cluster_change', _,
                                             #{N1 := _, N2 := _,
-                                              N3 := _, N4 := _},
+                                              N3 := _, N4 := #{voter := yes}},
                                             await_consensus}}]}},
      {send_rpc, N3,
       #append_entries_rpc{entries =
                           [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := _},
+                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := yes}},
                                    await_consensus}}],
                           term = 5, leader_id = N1,
                           prev_log_index = 3,
@@ -1324,7 +1325,48 @@ leader_server_join(_Config) ->
      {send_rpc, N2,
       #append_entries_rpc{entries =
                           [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := _},
+                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := yes}},
+                                   await_consensus}}],
+                          term = 5, leader_id = N1,
+                          prev_log_index = 3,
+                          prev_log_term = 5,
+                          leader_commit = 3}}
+     | _] = Effects,
+    ok.
+
+leader_server_maybe_join(_Config) ->
+    N1 = ?N1, N2 = ?N2, N3 = ?N3, N4 = ?N4,
+    OldCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
+                   N3 => new_peer_with(#{next_index => 4, match_index => 3})},
+    State0 = (base_state(3, ?FUNCTION_NAME))#{cluster => OldCluster},
+    Round0 = new_staging_status(State0),
+    % raft servers should switch to the new configuration after log append
+    % and further cluster changes should be disallowed
+    {leader, #{cluster := #{N1 := _, N2 := _, N3 := _, N4 := _},
+               cluster_change_permitted := false} = _State1, Effects} =
+        ra_server:handle_leader({command, {'$ra_maybe_join', meta(),
+                                           N4, await_consensus}}, State0),
+    [
+     {send_rpc, N4,
+      #append_entries_rpc{entries =
+                          [_, _, _, {4, 5, {'$ra_cluster_change', _,
+                                            #{N1 := _, N2 := _,
+                                              N3 := _, N4 := #{voter := {maybe, Round0}}},
+                                            await_consensus}}]}},
+     {send_rpc, N3,
+      #append_entries_rpc{entries =
+                          [{4, 5, {'$ra_cluster_change', _,
+                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {maybe, Round0}}},
+                                   await_consensus}}],
+                          term = 5, leader_id = N1,
+                          prev_log_index = 3,
+                          prev_log_term = 5,
+                          leader_commit = 3}},
+     {send_rpc, N2,
+      #append_entries_rpc{entries =
+                          [{4, 5, {'$ra_cluster_change', _,
+                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {maybe, Round0}}},
                                    await_consensus}}],
                           term = 5, leader_id = N1,
                           prev_log_index = 3,
@@ -2598,6 +2640,10 @@ new_peer() ->
 
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
+
+new_staging_status(State) ->
+    TargetIdx = maps:get(commit_index, State),
+    #{round => 0, target => TargetIdx , ts => os:system_time(millisecond)}.
 
 snap_meta(Idx, Term) ->
     snap_meta(Idx, Term, []).

@@ -94,6 +94,7 @@
                     | recovered | stop | receive_snapshot.
 
 -type command_type() :: '$usr' | '$ra_join' | '$ra_leave' |
+                        '$ra_maybe_join' |
                         '$ra_cluster_change' | '$ra_cluster'.
 
 -type command_meta() :: #{from => from(),
@@ -2093,6 +2094,15 @@ new_peer() ->
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
 
+new_staging_status(State) ->
+    TargetIdx = maps:get(commit_index, State),
+    #{round => 0, target => TargetIdx , ts => os:system_time(millisecond)}.
+
+already_member(State) ->
+    % already a member do nothing
+    % TODO: reply? If we don't reply the caller may block until timeout
+    {not_appended, already_member, State}.
+
 peers(#{cfg := #cfg{id = Id}, cluster := Peers}) ->
     maps:remove(Id, Peers).
 
@@ -2449,17 +2459,29 @@ add_reply(_, _, _, % From, Reply, Mode
 append_log_leader({CmdTag, _, _, _},
                   State = #{cluster_change_permitted := false})
   when CmdTag == '$ra_join' orelse
+       CmdTag == '$ra_maybe_join' orelse
        CmdTag == '$ra_leave' ->
     {not_appended, cluster_change_not_permitted, State};
 append_log_leader({'$ra_join', From, JoiningNode, ReplyMode},
                   State = #{cluster := OldCluster}) ->
     case OldCluster of
-        #{JoiningNode := _} ->
-            % already a member do nothing
-            % TODO: reply? If we don't reply the caller may block until timeout
-            {not_appended, already_member, State};
+        #{JoiningNode := #{voter := yes}} ->
+            already_member(State);
+        #{JoiningNode := #{voter := {maybe, _}} = Peer} ->
+            Cluster = OldCluster#{JoiningNode => Peer#{voter => yes}},
+            append_cluster_change(Cluster, From, ReplyMode, State);
         _ ->
             Cluster = OldCluster#{JoiningNode => new_peer()},
+            append_cluster_change(Cluster, From, ReplyMode, State)
+    end;
+append_log_leader({'$ra_maybe_join', From, JoiningNode, ReplyMode},
+                  State = #{cluster := OldCluster}) ->
+    case OldCluster of
+        #{JoiningNode := _} ->
+            already_member(State);
+        _ ->
+            Round0 = new_staging_status(State),
+            Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter => {maybe, Round0}})},
             append_cluster_change(Cluster, From, ReplyMode, State)
     end;
 append_log_leader({'$ra_leave', From, LeavingServer, ReplyMode},

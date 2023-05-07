@@ -52,12 +52,14 @@
 %% - Nonvoter, node does not participate in elections or consensus voting.
 %% - Staging, node is a temporary nonvoter, and will be automatically promoted
 %%            if it proves to be fast enough to stay up to dat with teh leader.
--type ra_voter() :: yes | no | {staging, staging_status()}.
+-type ra_voter() :: yes | no | {maybe, staging_status()}.
 
 %% For staging nodes we measure current round, target index and the timestamp of its start.
 %% If the node reaches target index and the ∂T is less than the election timeout, the node is
 %% considered eligible to become a voter.
--type staging_status() :: {ra_replication_round(), ra_index(), integer()}.
+-type staging_status() :: #{round  := ra_replication_round(),
+                            target := ra_index(),
+                            ts     := integer()}.
 
 -type ra_peer_state() :: #{next_index := non_neg_integer(),
                            match_index := non_neg_integer(),
