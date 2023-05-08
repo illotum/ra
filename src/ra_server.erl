@@ -85,6 +85,7 @@
       query_index := non_neg_integer(),
       queries_waiting_heartbeats := queue:queue({non_neg_integer(), consistent_query_ref()}),
       pending_consistent_queries := [consistent_query_ref()],
+      voter => 'maybe'(ra_voter()),
       commit_latency => 'maybe'(non_neg_integer())
      }.
 
@@ -1104,8 +1105,14 @@ handle_follower({ra_log_event, Evt}, State = #{log := Log0}) ->
     % simply forward all other events to ra_log
     {Log, Effects} = ra_log:handle_event(Evt, Log0),
     {follower, State#{log => Log}, Effects};
+handle_follower(#pre_vote_rpc{}, #{voter := {no, _}} = State) ->
+    %% ignore elections, non-voter
+    {follower, State, []};
 handle_follower(#pre_vote_rpc{} = PreVote, State) ->
     process_pre_vote(follower, PreVote, State);
+handle_follower(#request_vote_rpc{}, #{voter := {no, _}} = State) ->
+    %% ignore elections, non-voter
+    {follower, State, []};
 handle_follower(#request_vote_rpc{candidate_id = Cand, term = Term},
                 #{current_term := Term, voted_for := VotedFor,
                   cfg := #cfg{log_id = LogId}} = State)
@@ -1202,6 +1209,9 @@ handle_follower(#pre_vote_result{}, State) ->
 handle_follower(#append_entries_reply{}, State) ->
     %% handle to avoid logging as unhandled
     %% could receive a lot of these shortly after standing down as leader
+    {follower, State, []};
+handle_follower(election_timeout, #{voter := {no, _}} = State) ->
+    %% ignore elections, non-voter
     {follower, State, []};
 handle_follower(election_timeout, State) ->
     call_for_election(pre_vote, State);
@@ -2094,10 +2104,6 @@ new_peer() ->
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
 
-new_staging_status(State) ->
-    TargetIdx = maps:get(commit_index, State),
-    #{round => 0, target => TargetIdx , ts => os:system_time(millisecond)}.
-
 already_member(State) ->
     % already a member do nothing
     % TODO: reply? If we don't reply the caller may block until timeout
@@ -2329,6 +2335,7 @@ apply_with({Idx, Term, {'$ra_cluster_change', CmdMeta, NewCluster, ReplyType}},
                            [log_id(State0), maps:keys(NewCluster)]),
                     %% we are recovering and should apply the cluster change
                     State0#{cluster => NewCluster,
+                            voter => ra_voter:peer_status(id(State0), NewCluster),
                             cluster_change_permitted => true,
                             cluster_index_term => {Idx, Term}};
                 _  ->
@@ -2467,7 +2474,7 @@ append_log_leader({'$ra_join', From, JoiningNode, ReplyMode},
     case OldCluster of
         #{JoiningNode := #{voter := yes}} ->
             already_member(State);
-        #{JoiningNode := #{voter := {maybe, _}} = Peer} ->
+        #{JoiningNode := #{voter := {no, _}} = Peer} ->
             Cluster = OldCluster#{JoiningNode => Peer#{voter => yes}},
             append_cluster_change(Cluster, From, ReplyMode, State);
         _ ->
@@ -2480,8 +2487,7 @@ append_log_leader({'$ra_maybe_join', From, JoiningNode, ReplyMode},
         #{JoiningNode := _} ->
             already_member(State);
         _ ->
-            Round0 = new_staging_status(State),
-            Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter => {maybe, Round0}})},
+            Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter =>  ra_voter:new_nonvoter(State)})},
             append_cluster_change(Cluster, From, ReplyMode, State)
     end;
 append_log_leader({'$ra_leave', From, LeavingServer, ReplyMode},
@@ -2513,6 +2519,7 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
     case Cmd of
         {'$ra_cluster_change', _, Cluster, _} ->
             State#{cluster => Cluster,
+                   voter => ra_voter:peer_status(id(State), Cluster),
                    cluster_index_term => {Idx, Term}};
         _ ->
             % revert back to previous cluster
@@ -2524,6 +2531,7 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
 pre_append_log_follower({Idx, Term, {'$ra_cluster_change', _, Cluster, _}},
                         State) ->
     State#{cluster => Cluster,
+           voter => ra_voter:peer_status(id(State), Cluster),
            cluster_index_term => {Idx, Term}};
 pre_append_log_follower(_, State) ->
     State.
