@@ -57,11 +57,11 @@
                            % the commit index last sent
                            % used for evaluating pipeline status
                            commit_index_sent := non_neg_integer(),
+                           %% whether the peer is part of the consensus
+                           voter := ra_voter(),
                            %% indicates that a snapshot is being sent
                            %% to the peer
-                           status := ra_peer_status(),
-                           %% whether the peer is part of the consensus
-                           voter := ra_voter()}.
+                           status := ra_peer_status()}.
 
 -type ra_cluster() :: #{ra_server_id() => ra_peer_state()}.
 

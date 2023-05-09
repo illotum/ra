@@ -85,7 +85,6 @@
       query_index := non_neg_integer(),
       queries_waiting_heartbeats := queue:queue({non_neg_integer(), consistent_query_ref()}),
       pending_consistent_queries := [consistent_query_ref()],
-      voter => 'maybe'(ra_voter()),
       commit_latency => 'maybe'(non_neg_integer())
      }.
 
@@ -396,11 +395,15 @@ handle_leader({PeerId, #append_entries_reply{term = Term, success = true,
             Peer = Peer0#{match_index => max(MI, LastIdx),
                           next_index => max(NI, NextIdx)},
             State1 = put_peer(PeerId, Peer, State0),
-            {State2, Effects0} = evaluate_quorum(State1, []),
+            Effects00 = ra_voter:maybe_promote(PeerId, State1, []),
+
+            {State2, Effects0} = evaluate_quorum(State1, Effects00),
 
             {State, Effects1} = process_pending_consistent_queries(State2,
                                                                    Effects0),
+
             Effects = [{next_event, info, pipeline_rpcs} | Effects1],
+
             case State of
                 #{cluster := #{Id := _}} ->
                     % leader is in the cluster
@@ -1105,14 +1108,12 @@ handle_follower({ra_log_event, Evt}, State = #{log := Log0}) ->
     % simply forward all other events to ra_log
     {Log, Effects} = ra_log:handle_event(Evt, Log0),
     {follower, State#{log => Log}, Effects};
-handle_follower(#pre_vote_rpc{}, #{voter := {no, _}} = State) ->
-    %% ignore elections, non-voter
+handle_follower(#pre_vote_rpc{},
+                #{cfg := #cfg{log_id = LogId}, voter := {no, _} = Voter} = State) ->
+    ?WARN("~w: follower ignored request_vote_rpc, non voter: ~p", [LogId, Voter]),
     {follower, State, []};
 handle_follower(#pre_vote_rpc{} = PreVote, State) ->
     process_pre_vote(follower, PreVote, State);
-handle_follower(#request_vote_rpc{}, #{voter := {no, _}} = State) ->
-    %% ignore elections, non-voter
-    {follower, State, []};
 handle_follower(#request_vote_rpc{candidate_id = Cand, term = Term},
                 #{current_term := Term, voted_for := VotedFor,
                   cfg := #cfg{log_id = LogId}} = State)
@@ -1210,8 +1211,10 @@ handle_follower(#append_entries_reply{}, State) ->
     %% handle to avoid logging as unhandled
     %% could receive a lot of these shortly after standing down as leader
     {follower, State, []};
-handle_follower(election_timeout, #{voter := {no, _}} = State) ->
-    %% ignore elections, non-voter
+handle_follower(election_timeout,
+                #{cfg := #cfg{log_id = LogId}, voter := {no, _} = Voter} = State) ->
+    ?WARN("~w: follower ignored election_timeout, non voter: ~p",
+        [LogId, Voter]),
     {follower, State, []};
 handle_follower(election_timeout, State) ->
     call_for_election(pre_vote, State);
@@ -1380,6 +1383,7 @@ overview(#{cfg := #cfg{effective_machine_module = MacMod} = Cfg,
                     last_applied,
                     cluster,
                     leader_id,
+                    voter,
                     voted_for,
                     cluster_change_permitted,
                     cluster_index_term,
@@ -2098,8 +2102,8 @@ new_peer() ->
       match_index => 0,
       commit_index_sent => 0,
       query_index => 0,
-      status => normal,
-      voter => yes}.
+      voter => yes,
+      status => normal}.
 
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
@@ -2335,7 +2339,7 @@ apply_with({Idx, Term, {'$ra_cluster_change', CmdMeta, NewCluster, ReplyType}},
                            [log_id(State0), maps:keys(NewCluster)]),
                     %% we are recovering and should apply the cluster change
                     State0#{cluster => NewCluster,
-                            voter => ra_voter:peer_status(id(State0), NewCluster),
+                            voter => ra_voter:status(NewCluster, id(State0)),
                             cluster_change_permitted => true,
                             cluster_index_term => {Idx, Term}};
                 _  ->
@@ -2487,7 +2491,7 @@ append_log_leader({'$ra_maybe_join', From, JoiningNode, ReplyMode},
         #{JoiningNode := _} ->
             already_member(State);
         _ ->
-            Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter =>  ra_voter:new_nonvoter(State)})},
+            Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter => ra_voter:new_nonvoter(State)})},
             append_cluster_change(Cluster, From, ReplyMode, State)
     end;
 append_log_leader({'$ra_leave', From, LeavingServer, ReplyMode},
@@ -2519,7 +2523,6 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
     case Cmd of
         {'$ra_cluster_change', _, Cluster, _} ->
             State#{cluster => Cluster,
-                   voter => ra_voter:peer_status(id(State), Cluster),
                    cluster_index_term => {Idx, Term}};
         _ ->
             % revert back to previous cluster
@@ -2531,7 +2534,7 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
 pre_append_log_follower({Idx, Term, {'$ra_cluster_change', _, Cluster, _}},
                         State) ->
     State#{cluster => Cluster,
-           voter => ra_voter:peer_status(id(State), Cluster),
+           voter => ra_voter:status(Cluster, id(State)),
            cluster_index_term => {Idx, Term}};
 pre_append_log_follower(_, State) ->
     State.
@@ -2608,6 +2611,8 @@ query_indexes(#{cfg := #cfg{id = Id},
                 query_index := QueryIndex}) ->
     maps:fold(fun (PeerId, _, Acc) when PeerId == Id ->
                       Acc;
+                  (_K, #{voter := {no, _}}, Acc) ->
+                      Acc;
                   (_K, #{query_index := Idx}, Acc) ->
                       [Idx | Acc]
               end, [QueryIndex], Cluster).
@@ -2617,6 +2622,8 @@ match_indexes(#{cfg := #cfg{id = Id},
                 log := Log}) ->
     {LWIdx, _} = ra_log:last_written(Log),
     maps:fold(fun (PeerId, _, Acc) when PeerId == Id ->
+                      Acc;
+                  (_K, #{voter := {no, _}}, Acc) ->
                       Acc;
                   (_K, #{match_index := Idx}, Acc) ->
                       [Idx | Acc]

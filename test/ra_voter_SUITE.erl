@@ -8,264 +8,139 @@
 -compile(export_all).
 
 -include("src/ra.hrl").
--include("src/ra_server.hrl").
+-include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
+
+-define(PROCESS_COMMAND_TIMEOUT, 6000).
+-define(SYS, default).
 
 all() ->
     [
-        leader_server_maybe_join
+     {group, tests}
     ].
 
--define(MACFUN, fun (E, _) -> E end).
--define(N1, {n1, node()}).
--define(N2, {n2, node()}).
--define(N3, {n3, node()}).
--define(N4, {n4, node()}).
--define(N5, {n5, node()}).
-
 groups() ->
-    [ {tests, [], all()} ].
+    [
+     {tests, [], all_tests()}
+    ].
+
+all_tests() ->
+    [
+     maybe_join
+    ].
+
+suite() -> [{timetrap, {seconds, 120}}].
 
 init_per_suite(Config) ->
-    ok = logger:set_primary_config(level, all),
+    ok = logger:set_primary_config(level, warning),
     Config.
 
 end_per_suite(Config) ->
+    application:stop(ra),
+    Config.
+
+restart_ra(DataDir) ->
+    ok = application:set_env(ra, segment_max_entries, 128),
+    {ok, _} = ra:start_in(DataDir),
+    ok.
+
+init_per_group(_G, Config) ->
+    PrivDir = ?config(priv_dir, Config),
+    DataDir = filename:join([PrivDir, "data"]),
+    ok = restart_ra(DataDir),
+    Config.
+
+end_per_group(_, Config) ->
     Config.
 
 init_per_testcase(TestCase, Config) ->
-    ok = logger:set_primary_config(level, all),
-    ok = setup_log(),
-    [{test_case, TestCase} | Config].
+    [{test_name, ra_lib:to_list(TestCase)} | Config].
 
 end_per_testcase(_TestCase, Config) ->
-    meck:unload(),
+    ra_server_sup_sup:remove_all(default),
     Config.
 
-setup_log() ->
-    ok = meck:new(ra_log, []),
-    ok = meck:new(ra_snapshot, [passthrough]),
-    ok = meck:new(ra_machine, [passthrough]),
-    meck:expect(ra_log, init, fun(C) -> ra_log_memory:init(C) end),
-    meck:expect(ra_log_meta, store, fun (_, U, K, V) ->
-                                            put({U, K}, V), ok
-                                    end),
-    meck:expect(ra_log_meta, store_sync, fun (_, U, K, V) ->
-                                                 put({U, K}, V), ok
-                                         end),
-    meck:expect(ra_log_meta, fetch, fun(_, U, K) ->
-                                            get({U, K})
-                                    end),
-    meck:expect(ra_log_meta, fetch, fun (_, U, K, D) ->
-                                            ra_lib:default(get({U, K}), D)
-                                    end),
-    meck:expect(ra_snapshot, begin_accept,
-                fun(_Meta, SS) ->
-                        {ok, SS}
-                end),
-    meck:expect(ra_snapshot, accept_chunk,
-                fun(_Data, _OutOf, _Flag, SS) ->
-                        {ok, SS}
-                end),
-    meck:expect(ra_snapshot, abort_accept, fun(SS) -> SS end),
-    meck:expect(ra_snapshot, accepting, fun(_SS) -> undefined end),
-    meck:expect(ra_log, snapshot_state, fun (_) -> snap_state end),
-    meck:expect(ra_log, set_snapshot_state, fun (_, Log) -> Log end),
-    meck:expect(ra_log, install_snapshot, fun (_, _, Log) -> {Log, []} end),
-    meck:expect(ra_log, recover_snapshot, fun ra_log_memory:recover_snapshot/1),
-    meck:expect(ra_log, snapshot_index_term, fun ra_log_memory:snapshot_index_term/1),
-    meck:expect(ra_log, fold, fun ra_log_memory:fold/5),
-    meck:expect(ra_log, release_resources, fun ra_log_memory:release_resources/3),
-    meck:expect(ra_log, append_sync,
-                fun({Idx, Term, _} = E, L) ->
-                        L1 = ra_log_memory:append(E, L),
-                        {LX, _} = ra_log_memory:handle_event({written, {Idx, Idx, Term}}, L1),
-                        LX
-                end),
-    meck:expect(ra_log, write_config, fun ra_log_memory:write_config/2),
-    meck:expect(ra_log, next_index, fun ra_log_memory:next_index/1),
-    meck:expect(ra_log, append, fun ra_log_memory:append/2),
-    meck:expect(ra_log, write, fun ra_log_memory:write/2),
-    meck:expect(ra_log, handle_event, fun ra_log_memory:handle_event/2),
-    meck:expect(ra_log, last_written, fun ra_log_memory:last_written/1),
-    meck:expect(ra_log, last_index_term, fun ra_log_memory:last_index_term/1),
-    meck:expect(ra_log, set_last_index, fun ra_log_memory:set_last_index/2),
-    meck:expect(ra_log, fetch_term, fun ra_log_memory:fetch_term/2),
-    meck:expect(ra_log, needs_cache_flush, fun (_) -> false end),
-    meck:expect(ra_log, exists,
-                fun ({Idx, Term}, L) ->
-                        case ra_log_memory:fetch_term(Idx, L) of
-                            {Term, Log} -> {true, Log};
-                            {_, Log} -> {false, Log}
-                        end
-                end),
-    meck:expect(ra_log, update_release_cursor,
-                fun ra_log_memory:update_release_cursor/5),
+%%% Tests
+
+maybe_join(Config) ->
+    % form a cluster
+    [N1, N2] = start_local_cluster(2, ?config(test_name, Config), add_machine()),
+    _ = issue_op(N1, 5),
+    validate_state_on_node(N1, 5),
+    % add maybe member
+    N3 = nth_server_name(Config, 3),
+    ok = start_and_maybe_join(N1, N3),
+    _ = issue_op(N3, 5),
+    validate_state_on_node(N3, 10),
+    % validate all are voters after catch-up
+    All = [N1, N2, N3],
+    lists:map(fun(O) ->
+                ?assertEqual(All, voters(O)),
+                ?assertEqual([], nonvoters(O))
+              end, overviews(N1)),
+    terminate_cluster(All).
+
+%%% Helpers
+
+nth_server_name(Config, N) when is_integer(N) ->
+    {ra_server:name(?config(test_name, Config), erlang:integer_to_list(N)), node()}.
+
+add_machine() ->
+    {module, ?MODULE, #{}}.
+
+terminate_cluster(Nodes) ->
+    [ra:stop_server(?SYS, P) || P <- Nodes].
+
+new_server(Name, Config) ->
+    ClusterName = ?config(test_name, Config),
+    ok = ra:start_server(default, ClusterName, Name, add_machine(), []),
     ok.
 
-leader_server_maybe_join(_Config) ->
-    N1 = ?N1, N2 = ?N2, N3 = ?N3, N4 = ?N4,
-    OldCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
-                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
-                   N3 => new_peer_with(#{next_index => 4, match_index => 3})},
-    State0 = (base_state(3, ?FUNCTION_NAME))#{cluster => OldCluster},
-    % raft servers should switch to the new configuration after log append
-    % and further cluster changes should be disallowed
-    {leader, #{cluster := #{N1 := _, N2 := _, N3 := _, N4 := _},
-               cluster_change_permitted := false} = _State1, Effects} =
-        ra_server:handle_leader({command, {'$ra_maybe_join', meta(),
-                                           N4, await_consensus}}, State0),
-    % new member should join as non-voter
-    {no, #{round := Round, target := Target}} = ra_voter:new_nonvoter(State0),
-    [
-     {send_rpc, N4,
-      #append_entries_rpc{entries =
-                          [_, _, _, {4, 5, {'$ra_cluster_change', _,
-                                            #{N1 := _, N2 := _,
-                                              N3 := _, N4 := #{voter := {no, #{round := Round,
-                                                                                  target := Target,
-                                                                                  ts := _}}}},
-                                            await_consensus}}]}},
-     {send_rpc, N3,
-      #append_entries_rpc{entries =
-                          [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {no, #{round := Round,
-                                                                                  target := Target,
-                                                                                  ts := _}}}},
-                                   await_consensus}}],
-                          term = 5, leader_id = N1,
-                          prev_log_index = 3,
-                          prev_log_term = 5,
-                          leader_commit = 3}},
-     {send_rpc, N2,
-      #append_entries_rpc{entries =
-                          [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {no, #{round := Round,
-                                                                                  target := Target,
-                                                                                  ts := _}}}},
-                                   await_consensus}}],
-                          term = 5, leader_id = N1,
-                          prev_log_index = 3,
-                          prev_log_term = 5,
-                          leader_commit = 3}}
-     | _] = Effects,
+start_and_join({ClusterName, _} = ServerRef, {_, _} = New) ->
+    {ok, _, _} = ra:add_member(ServerRef, New),
+    ok = ra:start_server(default, ClusterName, New, add_machine(), [ServerRef]),
     ok.
 
-
-% %%% helpers
-
-ra_server_init(Conf) ->
-    ra_server:recover(ra_server:init(Conf)).
-
-init_servers(ServerIds, Machine) ->
-    lists:foldl(fun (ServerId, Acc) ->
-                        Args = #{cluster_name => some_id,
-                                 id => ServerId,
-                                 uid => atom_to_binary(element(1, ServerId), utf8),
-                                 initial_members => ServerIds,
-                                 log_init_args => #{uid => <<>>},
-                                 machine => Machine},
-                        Acc#{ServerId => {follower, ra_server_init(Args), []}}
-                end, #{}, ServerIds).
-
-list(L) when is_list(L) -> L;
-list(L) -> [L].
-
-entry(Idx, Term, Data) ->
-    {Idx, Term, {'$usr', meta(), Data, after_log_append}}.
-
-empty_state(NumServers, Id) ->
-    Servers = lists:foldl(fun(N, Acc) ->
-                                [{list_to_atom("n" ++ integer_to_list(N)), node()}
-                                 | Acc]
-                        end, [], lists:seq(1, NumServers)),
-    ra_server_init(#{cluster_name => someid,
-                     id => {Id, node()},
-                     uid => atom_to_binary(Id, utf8),
-                     initial_members => Servers,
-                     log_init_args => #{uid => <<>>},
-                     machine => {simple, fun (E, _) -> E end, <<>>}}). % just keep last applied value
-
-base_state(NumServers, MacMod) ->
-    Log0 = lists:foldl(fun(E, L) ->
-                               ra_log:append(E, L)
-                       end, ra_log:init(#{system_config => ra_system:default_config(),
-                                          uid => <<>>}),
-                       [{1, 1, usr(<<"hi1">>)},
-                       {2, 3, usr(<<"hi2">>)},
-                        {3, 5, usr(<<"hi3">>)}]),
-    {Log, _} = ra_log:handle_event({written, {1, 3, 5}}, Log0),
-
-    Servers = lists:foldl(fun(N, Acc) ->
-                                Name = {list_to_atom("n" ++ integer_to_list(N)), node()},
-                                Acc#{Name =>
-                                     new_peer_with(#{next_index => 4,
-                                                     match_index => 3})}
-                        end, #{}, lists:seq(1, NumServers)),
-    mock_machine(MacMod),
-    Cfg = #cfg{id = ?N1,
-               uid = <<"n1">>,
-               log_id = <<"n1">>,
-               metrics_key = n1,
-               machine = {machine, MacMod, #{}}, % just keep last applied value
-               machine_version = 0,
-               machine_versions = [{0, 0}],
-               effective_machine_version = 0,
-               effective_machine_module = MacMod,
-               system_config = ra_system:default_config()
-              },
-    #{cfg => Cfg,
-      leader_id => ?N1,
-      cluster => Servers,
-      cluster_index_term => {0, 0},
-      cluster_change_permitted => true,
-      machine_state => <<"hi3">>, % last entry has been applied
-      current_term => 5,
-      commit_index => 3,
-      last_applied => 3,
-      log => Log,
-      query_index => 0,
-      queries_waiting_heartbeats => queue:new(),
-      pending_consistent_queries => []}.
-
-mock_machine(Mod) ->
-    meck:new(Mod, [non_strict]),
-    meck:expect(Mod, init, fun (_) -> init_state end),
-    %% just keep the latest command as the state
-    meck:expect(Mod, apply, fun (_, Cmd, _) -> {Cmd, ok} end),
+start_and_maybe_join({ClusterName, _} = ServerRef, {_, _} = New) ->
+    {ok, _, _} = ra:maybe_add_member(ServerRef, New),
+    ok = ra:start_server(default, ClusterName, New, add_machine(), [ServerRef]),
     ok.
 
-usr_cmd(Data) ->
-    {command, usr(Data)}.
+start_local_cluster(Num, ClusterName, Machine) ->
+    Nodes = [{ra_server:name(ClusterName, integer_to_list(N)), node()}
+             || N <- lists:seq(1, Num)],
 
-usr(Data) ->
-    {'$usr', meta(), Data, after_log_append}.
+    {ok, _, Failed} = ra:start_cluster(default, ClusterName, Machine, Nodes),
+    ?assert(length(Failed) == 0),
+    Nodes.
 
-meta() ->
-    #{from => {self(), make_ref()},
-      ts => os:system_time(millisecond)}.
+remove_member(Name) ->
+    {ok, _IdxTerm, _Leader} = ra:remove_member(Name, Name),
+    ok.
+
+validate_state_on_node(Name, Expected) ->
+    {ok, Expected, _} = ra:consistent_query(Name, fun(X) -> X end).
 
 dump(T) ->
     ct:pal("DUMP: ~p", [T]),
     T.
 
-new_peer() ->
-    #{next_index => 1,
-      match_index => 0,
-      query_index => 0,
-      commit_index_sent => 0,
-      status => normal,
-      voter => yes}.
+issue_op(Name, Op) ->
+    {ok, _, Leader} = ra:process_command(Name, Op, ?PROCESS_COMMAND_TIMEOUT),
+    Leader.
 
-new_peer_with(Map) ->
-    maps:merge(new_peer(), Map).
+overviews(Node) ->
+    {ok, Members, _From} = ra:members(Node),
+    [ ra:member_overview(P) || {_, _} = P <- Members ].
 
-snap_meta(Idx, Term) ->
-    snap_meta(Idx, Term, []).
+voters({ok, #{cluster := Peers}, _} = _Overview) ->
+    [ Id || {Id, Status} <- maps:to_list(Peers), maps:get(voter, Status) =:= yes ].
 
-snap_meta(Idx, Term, Cluster) ->
-    #{index => Idx,
-      term => Term,
-      cluster => Cluster,
-      machine_version => 0}.
+nonvoters({ok, #{cluster := Peers}, _} = _Overview) ->
+    [ Id || {Id, Status} <- maps:to_list(Peers), maps:get(voter, Status) /= yes ].
 
+
+%% machine impl
+init(_) -> 0.
+apply(_Meta, Num, State) ->
+    {Num + State, Num + State}.
