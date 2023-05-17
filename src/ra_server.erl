@@ -94,7 +94,6 @@
                     | recovered | stop | receive_snapshot.
 
 -type command_type() :: '$usr' | '$ra_join' | '$ra_leave' |
-                        '$ra_maybe_join' |
                         '$ra_cluster_change' | '$ra_cluster'.
 
 -type command_meta() :: #{from => from(),
@@ -395,15 +394,11 @@ handle_leader({PeerId, #append_entries_reply{term = Term, success = true,
             Peer = Peer0#{match_index => max(MI, LastIdx),
                           next_index => max(NI, NextIdx)},
             State1 = put_peer(PeerId, Peer, State0),
-            Effects00 = ra_voter:maybe_promote(PeerId, State1, []),
-
-            {State2, Effects0} = evaluate_quorum(State1, Effects00),
+            {State2, Effects0} = evaluate_quorum(State1, []),
 
             {State, Effects1} = process_pending_consistent_queries(State2,
                                                                    Effects0),
-
             Effects = [{next_event, info, pipeline_rpcs} | Effects1],
-
             case State of
                 #{cluster := #{Id := _}} ->
                     % leader is in the cluster
@@ -781,7 +776,7 @@ handle_candidate(#request_vote_result{term = Term, vote_granted = true},
     NewVotes = Votes + 1,
     ?DEBUG("~ts: vote granted for term ~b votes ~b",
           [LogId, Term, NewVotes]),
-    case trunc(maps:size(Nodes) / 2) + 1 of
+    case need_acks(Nodes) of
         NewVotes ->
             {State1, Effects} = make_all_rpcs(initialise_peers(State0)),
             Noop = {noop, #{ts => erlang:system_time(millisecond)},
@@ -927,7 +922,7 @@ handle_pre_vote(#pre_vote_result{term = Term, vote_granted = true,
           [LogId, Token, Term, Votes + 1]),
     NewVotes = Votes + 1,
     State = update_term(Term, State0),
-    case trunc(maps:size(Nodes) / 2) + 1 of
+    case need_acks(Nodes) of
         NewVotes ->
             call_for_election(candidate, State);
         _ ->
@@ -1108,10 +1103,6 @@ handle_follower({ra_log_event, Evt}, State = #{log := Log0}) ->
     % simply forward all other events to ra_log
     {Log, Effects} = ra_log:handle_event(Evt, Log0),
     {follower, State#{log => Log}, Effects};
-handle_follower(#pre_vote_rpc{},
-                #{cfg := #cfg{log_id = LogId}, voter := {no, _} = Voter} = State) ->
-    ?WARN("~w: follower ignored request_vote_rpc, non voter: ~p", [LogId, Voter]),
-    {follower, State, []};
 handle_follower(#pre_vote_rpc{} = PreVote, State) ->
     process_pre_vote(follower, PreVote, State);
 handle_follower(#request_vote_rpc{candidate_id = Cand, term = Term},
@@ -1210,11 +1201,6 @@ handle_follower(#pre_vote_result{}, State) ->
 handle_follower(#append_entries_reply{}, State) ->
     %% handle to avoid logging as unhandled
     %% could receive a lot of these shortly after standing down as leader
-    {follower, State, []};
-handle_follower(election_timeout,
-                #{cfg := #cfg{log_id = LogId}, voter := {no, _} = Voter} = State) ->
-    ?WARN("~w: follower ignored election_timeout, non voter: ~p",
-        [LogId, Voter]),
     {follower, State, []};
 handle_follower(election_timeout, State) ->
     call_for_election(pre_vote, State);
@@ -1383,7 +1369,6 @@ overview(#{cfg := #cfg{effective_machine_module = MacMod} = Cfg,
                     last_applied,
                     cluster,
                     leader_id,
-                    voter,
                     voted_for,
                     cluster_change_permitted,
                     cluster_index_term,
@@ -2043,11 +2028,13 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                                          last_log_term = LLTerm},
                  #{cfg := #cfg{machine_version = OurMacVer,
                                effective_machine_version = EffMacVer},
-                   current_term := CurTerm} = State0)
+                   current_term := CurTerm,
+                   cluster := Cluster} = State0)
   when Term >= CurTerm  ->
     State = update_term(Term, State0),
     LastIdxTerm = last_idx_term(State),
-    case is_candidate_log_up_to_date(LLIdx, LLTerm, LastIdxTerm) of
+    case is_voter(Cand, Cluster) andalso
+         is_candidate_log_up_to_date(LLIdx, LLTerm, LastIdxTerm) of
         true when Version > ?RA_PROTO_VERSION->
             ?DEBUG("~ts: declining pre-vote for ~w for protocol version ~b",
                    [log_id(State0), Cand, Version]),
@@ -2072,8 +2059,10 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
         false ->
             ?DEBUG("~ts: declining pre-vote for ~w for term ~b,"
                    " candidate last log index term was: ~w~n"
-                   "Last log entry idxterm seen was: ~w",
-                   [log_id(State0), Cand, Term, {LLIdx, LLTerm}, LastIdxTerm]),
+                   "Last log entry idxterm seen was: ~w~n"
+                   "Voter status was: ~w~n",
+                   [log_id(State0), Cand, Term, {LLIdx, LLTerm}, LastIdxTerm,
+                    get_voter_status(Cand, Cluster)]),
             case FsmState of
                 follower ->
                     {FsmState, State, [start_election_timeout]};
@@ -2102,16 +2091,15 @@ new_peer() ->
       match_index => 0,
       commit_index_sent => 0,
       query_index => 0,
-      voter => yes,
       status => normal}.
 
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
 
-already_member(State) ->
-    % already a member do nothing
-    % TODO: reply? If we don't reply the caller may block until timeout
-    {not_appended, already_member, State}.
+new_matching_peer(#{commit_index := CI} = _State) ->
+    new_peer_with(#{
+        voter => {matching, CI}
+    }).
 
 peers(#{cfg := #cfg{id = Id}, cluster := Peers}) ->
     maps:remove(Id, Peers).
@@ -2339,7 +2327,6 @@ apply_with({Idx, Term, {'$ra_cluster_change', CmdMeta, NewCluster, ReplyType}},
                            [log_id(State0), maps:keys(NewCluster)]),
                     %% we are recovering and should apply the cluster change
                     State0#{cluster => NewCluster,
-                            voter => ra_voter:status(NewCluster, id(State0)),
                             cluster_change_permitted => true,
                             cluster_index_term => {Idx, Term}};
                 _  ->
@@ -2470,28 +2457,17 @@ add_reply(_, _, _, % From, Reply, Mode
 append_log_leader({CmdTag, _, _, _},
                   State = #{cluster_change_permitted := false})
   when CmdTag == '$ra_join' orelse
-       CmdTag == '$ra_maybe_join' orelse
        CmdTag == '$ra_leave' ->
     {not_appended, cluster_change_not_permitted, State};
 append_log_leader({'$ra_join', From, JoiningNode, ReplyMode},
                   State = #{cluster := OldCluster}) ->
     case OldCluster of
-        #{JoiningNode := #{voter := yes}} ->
-            already_member(State);
-        #{JoiningNode := #{voter := {no, _}} = Peer} ->
-            Cluster = OldCluster#{JoiningNode => Peer#{voter => yes}},
-            append_cluster_change(Cluster, From, ReplyMode, State);
-        _ ->
-            Cluster = OldCluster#{JoiningNode => new_peer()},
-            append_cluster_change(Cluster, From, ReplyMode, State)
-    end;
-append_log_leader({'$ra_maybe_join', From, JoiningNode, ReplyMode},
-                  State = #{cluster := OldCluster}) ->
-    case OldCluster of
         #{JoiningNode := _} ->
-            already_member(State);
+            % already a member do nothing
+            % TODO: reply? If we don't reply the caller may block until timeout
+            {not_appended, already_member, State};
         _ ->
-            Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter => ra_voter:new_nonvoter(State)})},
+            Cluster = OldCluster#{JoiningNode => new_matching_peer(State)},
             append_cluster_change(Cluster, From, ReplyMode, State)
     end;
 append_log_leader({'$ra_leave', From, LeavingServer, ReplyMode},
@@ -2534,7 +2510,6 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
 pre_append_log_follower({Idx, Term, {'$ra_cluster_change', _, Cluster, _}},
                         State) ->
     State#{cluster => Cluster,
-           voter => ra_voter:status(Cluster, id(State)),
            cluster_index_term => {Idx, Term}};
 pre_append_log_follower(_, State) ->
     State.
@@ -2611,10 +2586,11 @@ query_indexes(#{cfg := #cfg{id = Id},
                 query_index := QueryIndex}) ->
     maps:fold(fun (PeerId, _, Acc) when PeerId == Id ->
                       Acc;
-                  (_K, #{voter := {no, _}}, Acc) ->
-                      Acc;
-                  (_K, #{query_index := Idx}, Acc) ->
-                      [Idx | Acc]
+                  (_K, #{query_index := Idx} = Peer, Acc) ->
+                      case is_voter(Peer) of
+                          true -> [Idx | Acc];
+                          false -> Acc
+                      end
               end, [QueryIndex], Cluster).
 
 match_indexes(#{cfg := #cfg{id = Id},
@@ -2623,11 +2599,48 @@ match_indexes(#{cfg := #cfg{id = Id},
     {LWIdx, _} = ra_log:last_written(Log),
     maps:fold(fun (PeerId, _, Acc) when PeerId == Id ->
                       Acc;
-                  (_K, #{voter := {no, _}}, Acc) ->
-                      Acc;
-                  (_K, #{match_index := Idx}, Acc) ->
-                      [Idx | Acc]
+                  (_K, #{match_index := Idx} = Peer, Acc) ->
+                      case is_voter(Peer) of
+                          true -> [Idx | Acc];
+                          false -> Acc
+                      end
               end, [LWIdx], Cluster).
+
+get_voter_status(Id, Cluster) ->
+    case maps:get(Id, Cluster) of
+        undefined -> undefined;
+        Peer -> get_voter_status(Peer)
+    end.
+
+get_voter_status(#{voter := Status}) ->
+    Status;
+get_voter_status(_) ->
+    % Implicit 'yes' for initial cluster members, to differentiate from 'undefined' above.
+    yes.
+
+
+is_voter(Id, Cluster) ->
+    case maps:get(Id, Cluster) of
+        undefined -> false;
+        Peer -> is_voter(Peer)
+    end.
+
+is_voter(#{voter := {matching, Target}, match_index := MI})
+  when MI >= Target ->
+    true;
+is_voter(#{voter := {matching, _}}) ->
+    false;
+is_voter(_Peer) ->
+    true.
+
+need_acks(Cluster) ->
+    NumVoters = maps:fold(fun(_, Peer, Count) ->
+                            case is_voter(Peer) of
+                                true  -> Count + 1;
+                                false -> Count
+                            end
+                          end, 0, Cluster),
+    trunc(NumVoters / 2) + 1.
 
 -spec agreed_commit(list()) -> ra_index().
 agreed_commit(Indexes) ->

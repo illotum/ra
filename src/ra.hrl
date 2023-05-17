@@ -44,12 +44,9 @@
                           suspended |
                           disconnected.
 
--type ra_voter() :: yes | {no, ra_nonvoter_status()}.
-
--type ra_nonvoter_status() :: permanent |
-                              #{round  := non_neg_integer(),
-                                target := ra_index(),
-                                ts     := integer()}.
+% Leader doesn't count for majority purposes peers that
+% have matching_index lower than the predicate.
+-type ra_voter() :: {matching, ra_index()}.
 
 -type ra_peer_state() :: #{next_index := non_neg_integer(),
                            match_index := non_neg_integer(),
@@ -57,7 +54,7 @@
                            % the commit index last sent
                            % used for evaluating pipeline status
                            commit_index_sent := non_neg_integer(),
-                           %% whether the peer is part of the consensus
+                           %% whether peer is part of the consensus
                            voter := ra_voter(),
                            %% indicates that a snapshot is being sent
                            %% to the peer

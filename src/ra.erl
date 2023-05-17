@@ -59,8 +59,6 @@
          %% membership changes
          add_member/2,
          add_member/3,
-         maybe_add_member/2,
-         maybe_add_member/3,
          remove_member/2,
          remove_member/3,
          leave_and_terminate/3,
@@ -579,13 +577,6 @@ add_member(ServerLoc, ServerId) ->
 add_member(ServerLoc, ServerId, Timeout) ->
     ra_server_proc:command(ServerLoc,
                            {'$ra_join', ServerId, after_log_append},
-                           Timeout).
-
-maybe_add_member(ServerLoc, ServerId) ->
-    maybe_add_member(ServerLoc, ServerId, ?DEFAULT_TIMEOUT).
-maybe_add_member(ServerLoc, ServerId, Timeout) ->
-    ra_server_proc:command(ServerLoc,
-                           {'$ra_maybe_join', ServerId, after_log_append},
                            Timeout).
 
 

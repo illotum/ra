@@ -22,6 +22,7 @@ all() ->
      candidate_handles_append_entries_rpc,
      append_entries_reply_success,
      append_entries_reply_no_success,
+     append_entries_nonvoter,
      follower_request_vote,
      follower_pre_vote,
      pre_vote_receives_pre_vote,
@@ -41,7 +42,6 @@ all() ->
      follower_machine_version,
      follower_install_snapshot_machine_version,
      leader_server_join,
-     leader_server_maybe_join,
      leader_server_leave,
      leader_is_removed,
      follower_cluster_change,
@@ -876,6 +876,40 @@ append_entries_reply_no_success(_Config) ->
       ]} = ra_server:handle_leader(Msg, State),
     ok.
 
+append_entries_nonvoter(_Config) ->
+    N1 = ?N1, N2 = ?N2, N3 = ?N3, N4 = ?N4,
+    Cluster = #{N1 => new_peer_with(#{next_index => 5, match_index => 4}),
+                N2 => new_peer_with(#{next_index => 1, match_index => 0,
+                                      commit_index_sent => 3}),
+                N3 => new_peer_with(#{next_index => 2, match_index => 1}),
+                N4 => new_peer_with(#{next_index => 2, match_index => 1,
+                                      voter => {matching, 3}})},
+    State0 = (base_state(3, ?FUNCTION_NAME))#{
+                             commit_index => 1,
+                             last_applied => 1,
+                             cluster => Cluster,
+                             machine_state => <<"hi1">>},
+    Ack = #append_entries_reply{term = 5, success = true,
+                                     next_index = 4,
+                                     last_index = 3, last_term = 5},
+
+    % Response from N2, effective cluster size 3, one ack sufficient.
+    {leader, #{cluster := #{N2 := #{next_index := 4,
+                                    match_index := 3}},
+               commit_index := 3,
+               last_applied := 3,
+               machine_state := <<"hi3">>},
+     _} = ra_server:handle_leader({N2, Ack}, State0),
+
+    % Response from N4, cluster grows to 4, one ack insufficient.
+    {leader, #{cluster := #{N4 := #{next_index := 4,
+                                    match_index := 3}},
+               commit_index := 1,
+               last_applied := 1,
+               machine_state := <<"hi1">>},
+     _} = ra_server:handle_leader({N4, Ack}, State0),
+    ok.
+
 follower_request_vote(_Config) ->
     N2 = ?N2, N3 = ?N3,
     State = base_state(3, ?FUNCTION_NAME),
@@ -1299,7 +1333,7 @@ leader_server_join(_Config) ->
     OldCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
                    N2 => new_peer_with(#{next_index => 4, match_index => 3}),
                    N3 => new_peer_with(#{next_index => 4, match_index => 3})},
-    State0 = (base_state(3, ?FUNCTION_NAME))#{cluster => OldCluster},
+    State0 = #{commit_index := CI} = (base_state(3, ?FUNCTION_NAME))#{cluster => OldCluster},
     % raft servers should switch to the new configuration after log append
     % and further cluster changes should be disallowed
     {leader, #{cluster := #{N1 := _, N2 := _, N3 := _, N4 := _},
@@ -1311,12 +1345,12 @@ leader_server_join(_Config) ->
       #append_entries_rpc{entries =
                           [_, _, _, {4, 5, {'$ra_cluster_change', _,
                                             #{N1 := _, N2 := _,
-                                              N3 := _, N4 := #{voter := yes}},
+                                              N3 := _, N4 := #{voter := {matching, CI}}},
                                             await_consensus}}]}},
      {send_rpc, N3,
       #append_entries_rpc{entries =
                           [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := yes}},
+                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {matching, CI}}},
                                    await_consensus}}],
                           term = 5, leader_id = N1,
                           prev_log_index = 3,
@@ -1325,55 +1359,7 @@ leader_server_join(_Config) ->
      {send_rpc, N2,
       #append_entries_rpc{entries =
                           [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := yes}},
-                                   await_consensus}}],
-                          term = 5, leader_id = N1,
-                          prev_log_index = 3,
-                          prev_log_term = 5,
-                          leader_commit = 3}}
-     | _] = Effects,
-    ok.
-
-leader_server_maybe_join(_Config) ->
-    N1 = ?N1, N2 = ?N2, N3 = ?N3, N4 = ?N4,
-    OldCluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
-                   N2 => new_peer_with(#{next_index => 4, match_index => 3}),
-                   N3 => new_peer_with(#{next_index => 4, match_index => 3})},
-    State0 = (base_state(3, ?FUNCTION_NAME))#{cluster => OldCluster},
-    % raft servers should switch to the new configuration after log append
-    % and further cluster changes should be disallowed
-    {leader, #{cluster := #{N1 := _, N2 := _, N3 := _, N4 := _},
-               cluster_change_permitted := false} = _State1, Effects} =
-        ra_server:handle_leader({command, {'$ra_maybe_join', meta(),
-                                           N4, await_consensus}}, State0),
-    % new member should join as non-voter
-    {no, #{round := Round, target := Target}} = ra_voter:new_nonvoter(State0),
-    [
-     {send_rpc, N4,
-      #append_entries_rpc{entries =
-                          [_, _, _, {4, 5, {'$ra_cluster_change', _,
-                                            #{N1 := _, N2 := _,
-                                              N3 := _, N4 := #{voter := {no, #{round := Round,
-                                                                                  target := Target,
-                                                                                  ts := _}}}},
-                                            await_consensus}}]}},
-     {send_rpc, N3,
-      #append_entries_rpc{entries =
-                          [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {no, #{round := Round,
-                                                                                  target := Target,
-                                                                                  ts := _}}}},
-                                   await_consensus}}],
-                          term = 5, leader_id = N1,
-                          prev_log_index = 3,
-                          prev_log_term = 5,
-                          leader_commit = 3}},
-     {send_rpc, N2,
-      #append_entries_rpc{entries =
-                          [{4, 5, {'$ra_cluster_change', _,
-                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {no, #{round := Round,
-                                                                                  target := Target,
-                                                                                  ts := _}}}},
+                                   #{N1 := _, N2 := _, N3 := _, N4 := #{voter := {matching, CI}}},
                                    await_consensus}}],
                           term = 5, leader_id = N1,
                           prev_log_index = 3,
@@ -1491,21 +1477,12 @@ leader_applies_new_cluster(_Config) ->
     AEReply = #append_entries_reply{term = 5, success = true,
                                     next_index = 5,
                                     last_index = 4, last_term = 5},
-    % leader does not yet have consensus as will need at least 3 votes
-    {leader, State3 = #{commit_index := 3,
-
-                        cluster_change_permitted := false,
-                        cluster_index_term := {4, 5},
-                        cluster := #{N2 := #{next_index := 5,
-                                             match_index := 4}}},
-     _} = ra_server:handle_leader({N2, AEReply}, State2#{votes => 1}),
-
-    % leader has consensus
-    {leader, _State4 = #{commit_index := 4,
+    % new peer doesn't count until it reaches its matching target, leader needs only 2 votes
+    {leader, _State3 = #{commit_index := 4,
                          cluster_change_permitted := true,
-                         cluster := #{N3 := #{next_index := 5,
+                         cluster := #{N2 := #{next_index := 5,
                                               match_index := 4}}},
-     _Effects} = ra_server:handle_leader({N3, AEReply}, State3),
+     _} = ra_server:handle_leader({N2, AEReply}, State2#{votes => 1}),
     ok.
 
 leader_appends_cluster_change_then_steps_before_applying_it(_Config) ->
@@ -2642,11 +2619,15 @@ new_peer() ->
       match_index => 0,
       query_index => 0,
       commit_index_sent => 0,
-      voter => yes,
       status => normal}.
 
 new_peer_with(Map) ->
     maps:merge(new_peer(), Map).
+
+new_matching_peer(#{commit_index := CI} = _State) ->
+    new_peer_with(#{
+        voter => {matching, CI}
+    }).
 
 snap_meta(Idx, Term) ->
     snap_meta(Idx, Term, []).
