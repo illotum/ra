@@ -673,8 +673,8 @@ force_start_follower_as_single_member(Config) ->
     UId4 = ?config(uid4, Config),
     Conf4 = conf(ClusterName, UId4, ServerId4, PrivDir, [ServerId3]),
     {ok, _, _} = ra:add_member(ServerId3, ServerId4),
-    %% the membership has changed but member not running yet
-    {timeout,_} = ra:process_command(ServerId3, {enq, banana}),
+    %% new member joins as non-voter and doesn't affect quorum size
+    {ok, _, ServerId3} = ra:process_command(ServerId3, {enq, banana}),
     %% start new member
     ok = ra:start_server(?SYS, Conf4),
     {ok, _, ServerId3} = ra:members(ServerId4),

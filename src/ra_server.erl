@@ -776,7 +776,7 @@ handle_candidate(#request_vote_result{term = Term, vote_granted = true},
     NewVotes = Votes + 1,
     ?DEBUG("~ts: vote granted for term ~b votes ~b",
           [LogId, Term, NewVotes]),
-    case need_acks(Nodes) of
+    case trunc(maps:size(Nodes) / 2) + 1 of
         NewVotes ->
             {State1, Effects} = make_all_rpcs(initialise_peers(State0)),
             Noop = {noop, #{ts => erlang:system_time(millisecond)},
@@ -922,7 +922,7 @@ handle_pre_vote(#pre_vote_result{term = Term, vote_granted = true,
           [LogId, Token, Term, Votes + 1]),
     NewVotes = Votes + 1,
     State = update_term(Term, State0),
-    case need_acks(Nodes) of
+    case trunc(maps:size(Nodes) / 2) + 1 of
         NewVotes ->
             call_for_election(candidate, State);
         _ ->
@@ -1357,10 +1357,11 @@ handle_state_enter(RaftState, #{cfg := #cfg{effective_machine_module = MacMod},
 
 
 -spec overview(ra_server_state()) -> map().
-overview(#{cfg := #cfg{effective_machine_module = MacMod} = Cfg,
+overview(#{cfg := #cfg{id = Id, effective_machine_module = MacMod} = Cfg,
            log := Log,
            machine_state := MacState,
            aux_state := Aux,
+           cluster := Cluster,
            queries_waiting_heartbeats := Queries
           } = State) ->
     NumQueries = queue:len(Queries),
@@ -1374,9 +1375,22 @@ overview(#{cfg := #cfg{effective_machine_module = MacMod} = Cfg,
                     cluster_index_term,
                     query_index
                    ], State),
-    O = maps:merge(O0, cfg_to_map(Cfg)),
+    O1 = maps:merge(O0, cfg_to_map(Cfg)),
     LogOverview = ra_log:overview(Log),
     MacOverview = ra_machine:overview(MacMod, MacState),
+    case maps:get(leader_id, State, undefined) of
+         Id ->
+            O = O1#{
+                   voters => maps:fold(fun(PeerId, Status, Voters) ->
+                                               case is_voter(Status) of
+                                                   true -> [PeerId | Voters];
+                                                   false -> Voters
+                                               end
+                                       end, [], Cluster)
+                  };
+        _      ->
+            O = O1
+    end,
     O#{log => LogOverview,
        aux => Aux,
        machine => MacOverview,
@@ -2033,7 +2047,8 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
   when Term >= CurTerm  ->
     State = update_term(Term, State0),
     LastIdxTerm = last_idx_term(State),
-    case is_voter(Cand, Cluster) andalso
+    CandidateIsVoter = is_voter(Cand, Cluster, LLIdx),
+    case CandidateIsVoter andalso
          is_candidate_log_up_to_date(LLIdx, LLTerm, LastIdxTerm) of
         true when Version > ?RA_PROTO_VERSION->
             ?DEBUG("~ts: declining pre-vote for ~w for protocol version ~b",
@@ -2064,7 +2079,7 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                    [log_id(State0), Cand, Term, {LLIdx, LLTerm}, LastIdxTerm,
                     get_voter_status(Cand, Cluster)]),
             case FsmState of
-                follower ->
+                follower when CandidateIsVoter ->
                     {FsmState, State, [start_election_timeout]};
                 _ ->
                     {FsmState, State,
@@ -2619,28 +2634,27 @@ get_voter_status(_) ->
     yes.
 
 
-is_voter(Id, Cluster) ->
-    case maps:get(Id, Cluster) of
+is_voter(Id, Cluster, Idx) ->
+    case maps:get(Id, Cluster, undefined) of
         undefined -> false;
-        Peer -> is_voter(Peer)
+        Peer -> is_voter(Peer, Idx)
     end.
 
-is_voter(#{voter := {matching, Target}, match_index := MI})
+is_voter(#{} = Peer) ->
+    is_voter(Peer, undefined).
+
+is_voter(#{voter := {matching, Target}, match_index := MI}, undefined)
   when MI >= Target ->
     true;
-is_voter(#{voter := {matching, _}}) ->
+is_voter(#{voter := {matching, _}}, undefined) ->
     false;
-is_voter(_Peer) ->
+is_voter(#{voter := {matching, Target}}, Idx)
+  when Idx >= Target ->
+    true;
+is_voter(#{voter := {matching, _}}, _Idx) ->
+    false;
+is_voter(#{}, _) ->
     true.
-
-need_acks(Cluster) ->
-    NumVoters = maps:fold(fun(_, Peer, Count) ->
-                            case is_voter(Peer) of
-                                true  -> Count + 1;
-                                false -> Count
-                            end
-                          end, 0, Cluster),
-    trunc(NumVoters / 2) + 1.
 
 -spec agreed_commit(list()) -> ra_index().
 agreed_commit(Indexes) ->

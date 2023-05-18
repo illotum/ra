@@ -884,7 +884,7 @@ append_entries_nonvoter(_Config) ->
                 N3 => new_peer_with(#{next_index => 2, match_index => 1}),
                 N4 => new_peer_with(#{next_index => 2, match_index => 1,
                                       voter => {matching, 3}})},
-    State0 = (base_state(3, ?FUNCTION_NAME))#{
+    State0 = (base_state(4, ?FUNCTION_NAME))#{
                              commit_index => 1,
                              last_applied => 1,
                              cluster => Cluster,
@@ -956,9 +956,13 @@ follower_request_vote(_Config) ->
      ok.
 
 follower_pre_vote(_Config) ->
-    State = base_state(3, ?FUNCTION_NAME),
-    Term = 5,
-    Token = make_ref(),
+    Term = 5, Token = make_ref(), N1 = ?N1, N2 = ?N2, N3 = ?N3,
+    Cluster = #{N1 => new_peer_with(#{next_index => 4, match_index => 3}),
+                N2 => new_peer_with(#{next_index => 4, match_index => 3,
+                                      voter => {matching, 3}}),
+                N3 => new_peer_with(#{next_index => 4, match_index => 3,
+                                      voter => {matching, 4}})},
+    State = (base_state(3, ?FUNCTION_NAME))#{cluster => Cluster},
     Msg = #pre_vote_rpc{candidate_id = ?N2, term = Term, last_log_index = 3,
                         machine_version = 0,
                         token = Token, last_log_term = 5},
@@ -967,6 +971,13 @@ follower_pre_vote(_Config) ->
      [{reply, #pre_vote_result{term = Term, token = Token,
                                vote_granted = true}}]} =
         ra_server:handle_follower(Msg, State),
+
+    % disallow pre votes from non-voters
+    {follower, _,
+     [{reply, #pre_vote_result{term = Term, token = Token,
+                               vote_granted = false}}]} =
+    ra_server:handle_follower(Msg#pre_vote_rpc{candidate_id = N3},
+                              State),
 
     % disallow pre votes from higher protocol version
     ?assertMatch(
