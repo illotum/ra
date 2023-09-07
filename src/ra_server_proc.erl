@@ -271,7 +271,7 @@ init(Config) ->
 do_init(#{id := Id,
           cluster_name := ClusterName} = Config0) ->
     Key = ra_lib:ra_server_id_to_local_name(Id),
-    true = ets:insert(ra_state, {Key, init}),
+    true = ets:insert(ra_state, {Key, init, unknown}),
     process_flag(trap_exit, true),
     Config = #{counter := Counter,
                system_config := SysConf} = maps:merge(config_defaults(Id),
