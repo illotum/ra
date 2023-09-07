@@ -295,21 +295,25 @@ init(#{id := Id,
 
     LatestMacVer = ra_machine:version(Machine),
 
-    {_FirstIndex, Cluster0, MacVer, MacState,
+    {Cluster, VoterStatus,
+     MacVer, MacState,
      {SnapshotIdx, _} = SnapshotIndexTerm} =
         case ra_log:recover_snapshot(Log0) of
             undefined ->
                 InitialMachineState = ra_machine:init(Machine, Name),
-                {0, make_cluster(Id, InitialNodes),
-                 0, InitialMachineState, {0, 0}};
-            {#{index := Idx,
-               term := Term,
+                Voter = case maps:get(voter, Config, true) of
+                          false ->
+                              new_nonvoter(init);
+                          true ->
+                              voter
+                        end,
+                {make_cluster(Id, InitialNodes), Voter, 0, InitialMachineState, {0, 0}};
+            {#{index := Idx, term := Term,
                cluster := ClusterNodes,
-               machine_version := MacVersion}, MacSt} ->
-                Clu = make_cluster(Id, ClusterNodes),
-                %% the snapshot is the last index before the first index
-                %% TODO: should this be Idx + 1?
-                {Idx + 1, Clu, MacVersion, MacSt, {Idx, Term}}
+               machine_version := MacVersion} = Snapshot, MacSt} ->
+                Nonvoters = maps:get(non_voters, Snapshot, []),
+                Clu = make_cluster(Id, ClusterNodes, Nonvoters, snapshot),
+                {Clu, voter_status(Id, Clu), MacVersion, MacSt, {Idx, Term}}
         end,
     MacMod = ra_machine:which_module(Machine, MacVer),
 
@@ -331,18 +335,9 @@ init(#{id := Id,
     put_counter(Cfg, ?C_RA_SVR_METRIC_LAST_APPLIED, SnapshotIdx),
     put_counter(Cfg, ?C_RA_SVR_METRIC_TERM, CurrentTerm),
 
-    VoterStatus = case maps:get(voter, Config, true) of
-                      false ->
-                          {nonvoter, init};
-                      true ->
-                          voter
-                  end,
-    Peer = maps:get(Id, Cluster0),
-    Cluster1 = Cluster0#{Id => Peer#{voter_status => VoterStatus}},
-
     #{cfg => Cfg,
       current_term => CurrentTerm,
-      cluster => Cluster1,
+      cluster => Cluster,
       % There may be scenarios when a single server
       % starts up but hasn't
       % yet re-applied its noop command that we may receive other join
@@ -1296,13 +1291,14 @@ handle_receive_snapshot(#install_snapshot_rpc{term = Term,
                           Cfg0
                   end,
 
-            {#{cluster := ClusterIds}, MacState} = ra_log:recover_snapshot(Log),
+            {#{cluster := ClusterIds} = Snapshot, MacState} = ra_log:recover_snapshot(Log),
+            Nonvoters = maps:get(non_voters, Snapshot, []),
             State = update_term(Term,
                                 State0#{cfg => Cfg,
                                         log => Log,
                                         commit_index => SnapIndex,
                                         last_applied => SnapIndex,
-                                        cluster => make_cluster(Id, ClusterIds),
+                                        cluster => make_cluster(Id, ClusterIds, Nonvoters, remote_snapshot),
                                         machine_state => MacState}),
             %% it was the last snapshot chunk so we can revert back to
             %% follower status
@@ -2245,8 +2241,15 @@ fetch_term(Idx, #{log := Log0} = State) ->
     end.
 
 make_cluster(Self, Nodes) ->
+  make_cluster(Self, Nodes, [], all_voters).
+
+make_cluster(Self, Nodes, Nonvoters, Reason) ->
     case lists:foldl(fun(N, Acc) ->
-                             Acc#{N => new_peer()}
+                         P = case lists:member(N, Nonvoters) of
+                               true -> new_nonvoter(Reason);
+                               false -> new_peer()
+                             end,
+                         Acc#{N =>P}
                      end, #{}, Nodes) of
         #{Self := _} = Cluster ->
             % current server is already in cluster - do nothing
@@ -2895,9 +2898,11 @@ already_member(State) ->
 %%% Voter status helpers
 %%% ====================
 
--spec new_nonvoter(ra_server_state()) -> ra_voter_status().
+-spec new_nonvoter(ra_server_state() | atom()) -> ra_voter_status().
 new_nonvoter(#{commit_index := Target} = _State) ->
-    {nonvoter, #{target => Target}}.
+    {nonvoter, #{target => Target}};
+new_nonvoter(Reason) when is_atom(Reason) ->
+    {nonvoter, Reason}.
 
 -spec maybe_promote_voter(ra_server_id(), ra_server_state(), effects()) -> effects().
 maybe_promote_voter(PeerID, #{cluster := Cluster} = _State, Effects) ->

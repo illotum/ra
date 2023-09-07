@@ -149,6 +149,7 @@
 -type snapshot_meta() :: #{index := ra_index(),
                            term := ra_term(),
                            cluster := ra_cluster_servers(),
+                           non_voters => ra_cluster_servers(),
                            machine_version := ra_machine:version()}.
 
 -record(install_snapshot_rpc,

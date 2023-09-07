@@ -29,6 +29,9 @@ all() ->
 
 all_tests() ->
     [
+     nonvoter_catches_up,
+     nonvoter_catches_up_after_restart,
+     nonvoter_catches_up_after_leader_restart,
      start_stop_restart_delete_on_remote,
      start_cluster,
      start_or_restart_cluster,
@@ -388,6 +391,91 @@ disconnected_node_catches_up(Config) ->
               {ok, #{log := #{snapshot_index := SI}}, _} =
                   ra:member_overview(DownServerId),
               SI /= undefined
+      end, 200),
+
+    [ok = slave:stop(S) || {_, S} <- ServerIds],
+    ok.
+
+nonvoter_catches_up(Config) ->
+    PrivDir = ?config(data_dir, Config),
+    ClusterName = ?config(cluster_name, Config),
+    [A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
+    Machine = {module, ?MODULE, #{}},
+    {ok, Started, []} = ra:start_cluster(?SYS, ClusterName, Machine, [A, B]),
+    {ok, _, Leader} = ra:members(hd(Started)),
+
+    [ok = ra:pipeline_command(Leader, N, no_correlation, normal)
+     || N <- lists:seq(1, 10000)],
+    {ok, _, _} = ra:process_command(Leader, banana),
+
+    New = #{id => C, voter => false},
+    {ok, _, _} = ra:add_member(A, New),
+    ok = ra:start_server(?SYS, ClusterName, New, Machine, [A, B]),
+    ?assertMatch({ok, #{voter_status := {nonvoter, _}}, _},
+                 ra:member_overview(C)),
+
+    await_condition(
+      fun () ->
+          {ok, O2, _} = ra:member_overview(C),
+          voter == maps:get(voter_status, O2)
+      end, 200),
+
+    [ok = slave:stop(S) || {_, S} <- ServerIds],
+    ok.
+
+nonvoter_catches_up_after_restart(Config) ->
+    PrivDir = ?config(data_dir, Config),
+    ClusterName = ?config(cluster_name, Config),
+    [A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
+    Machine = {module, ?MODULE, #{}},
+    {ok, Started, []} = ra:start_cluster(?SYS, ClusterName, Machine, [A, B]),
+    {ok, _, Leader} = ra:members(hd(Started)),
+
+    [ok = ra:pipeline_command(Leader, N, no_correlation, normal)
+     || N <- lists:seq(1, 10000)],
+    {ok, _, _} = ra:process_command(Leader, banana),
+
+    New = #{id => C, voter => false},
+    {ok, _, _} = ra:add_member(A, New),
+    ok = ra:start_server(?SYS, ClusterName, New, Machine, [A, B]),
+    ?assertMatch({ok, #{voter_status := {nonvoter, _}}, _},
+                 ra:member_overview(C)),
+    ok = ra:stop_server(?SYS, C),
+    ok = ra:restart_server(?SYS, C),
+
+    await_condition(
+      fun () ->
+          {ok, O2, _} = ra:member_overview(C),
+          voter == maps:get(voter_status, O2)
+      end, 200),
+
+    [ok = slave:stop(S) || {_, S} <- ServerIds],
+    ok.
+
+nonvoter_catches_up_after_leader_restart(Config) ->
+    PrivDir = ?config(data_dir, Config),
+    ClusterName = ?config(cluster_name, Config),
+    [A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
+    Machine = {module, ?MODULE, #{}},
+    {ok, Started, []} = ra:start_cluster(?SYS, ClusterName, Machine, [A, B]),
+    {ok, _, Leader} = ra:members(hd(Started)),
+
+    [ok = ra:pipeline_command(Leader, N, no_correlation, normal)
+     || N <- lists:seq(1, 10000)],
+    {ok, _, _} = ra:process_command(Leader, banana),
+
+    New = #{id => C, voter => false},
+    {ok, _, _} = ra:add_member(A, New),
+    ok = ra:start_server(?SYS, ClusterName, New, Machine, [A, B]),
+    ?assertMatch({ok, #{voter_status := {nonvoter, _}}, _},
+                 ra:member_overview(C)),
+    ok = ra:stop_server(?SYS, Leader),
+    ok = ra:restart_server(?SYS, Leader),
+
+    await_condition(
+      fun () ->
+          {ok, O2, _} = ra:member_overview(C),
+          voter == maps:get(voter_status, O2)
       end, 200),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],

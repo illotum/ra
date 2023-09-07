@@ -71,7 +71,7 @@ end_per_testcase(_TestCase, _Config) ->
 
 roundtrip(Config) ->
     Dir = ?config(dir, Config),
-    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}]),
+    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}], [{banana, node@savanna}]),
     SnapshotRef = my_state,
     ok = ra_log_snapshot:write(Dir, SnapshotMeta, SnapshotRef),
     Context = #{can_accept_full_file => true},
@@ -80,7 +80,7 @@ roundtrip(Config) ->
 
 roundtrip_compat(Config) ->
     Dir = ?config(dir, Config),
-    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}]),
+    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}], [{banana, node@savanna}]),
     SnapshotRef = my_state,
     ok = ra_log_snapshot:write(Dir, SnapshotMeta, SnapshotRef),
     ?assertEqual({SnapshotMeta, SnapshotRef}, read(Dir)),
@@ -105,7 +105,7 @@ test_accept(Config, Name, DataSize, FullFile, ChunkSize) ->
     Dir = dir(?config(dir, Config), Name),
     AcceptDir = dir(?config(accept_dir, Config), Name),
     ct:pal("test_accept ~w ~b ~w ~b", [Name, DataSize, FullFile, ChunkSize]),
-    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}]),
+    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}], [{banana, node@savanna}]),
     SnapshotRef = crypto:strong_rand_bytes(DataSize),
     ok = ra_log_snapshot:write(Dir, SnapshotMeta, SnapshotRef),
     Context = #{can_accept_full_file => FullFile},
@@ -178,7 +178,7 @@ recover_invalid_checksum(Config) ->
 
 read_meta_data(Config) ->
     Dir = ?config(dir, Config),
-    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}]),
+    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}], [{banana, node@savanna}]),
     SnapshotRef = my_state,
     ok = ra_log_snapshot:write(Dir, SnapshotMeta, SnapshotRef),
     {ok, SnapshotMeta} = ra_log_snapshot:read_meta(Dir),
@@ -186,7 +186,7 @@ read_meta_data(Config) ->
 
 recover_same_as_read(Config) ->
     Dir = ?config(dir, Config),
-    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}]),
+    SnapshotMeta = meta(33, 94, [{banana, node@jungle}, {banana, node@savanna}], [{banana, node@savanna}]),
     SnapshotData = my_state,
     ok = ra_log_snapshot:write(Dir, SnapshotMeta, SnapshotData),
     {ok, SnapshotMeta, SnapshotData} = ra_log_snapshot:recover(Dir),
@@ -194,8 +194,9 @@ recover_same_as_read(Config) ->
 
 %% Utility
 
-meta(Idx, Term, Cluster) ->
+meta(Idx, Term, Cluster, Nonvoters) ->
     #{index => Idx,
       term => Term,
       cluster => Cluster,
+      non_voters => Nonvoters,
       machine_version => 1}.
