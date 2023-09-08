@@ -271,7 +271,7 @@ init(Config) ->
 do_init(#{id := Id,
           cluster_name := ClusterName} = Config0) ->
     Key = ra_lib:ra_server_id_to_local_name(Id),
-    true = ets:insert(ra_state, {Key, init, unknown}),
+    true = ets:insert(ra_state, {Key, init}),
     process_flag(trap_exit, true),
     Config = #{counter := Counter,
                system_config := SysConf} = maps:merge(config_defaults(Id),
@@ -784,19 +784,11 @@ follower(_, tick_timeout, State0) ->
      set_tick_timer(State, Actions)};
 follower({call, From}, {log_fold, Fun, Term}, State) ->
     fold_log(From, Fun, Term, State);
-follower(EventType, Msg, #state{conf = #conf{name = Name},
-                                server_state = SS0} = State0) ->
-    Voter0 = ra_server:voter_status(SS0),
+follower(EventType, Msg, State0) ->
     case handle_follower(Msg, State0) of
         {follower, State1, Effects} ->
             {State2, Actions} = ?HANDLE_EFFECTS(Effects, EventType, State1),
-            State = #state{server_state = SS} = follower_leader_change(State0, State2),
-            case ra_server:voter_status(SS) of
-                Voter0 ->
-                    ok;
-                Voter ->
-                    true = ets:update_element(ra_state, Name, {3, Voter})
-            end,
+            State = follower_leader_change(State0, State2),
             {keep_state, State, Actions};
         {pre_vote, State1, Effects} ->
             {State, Actions} = ?HANDLE_EFFECTS(Effects, EventType, State1),
@@ -982,6 +974,7 @@ terminate(Reason, StateName,
             catch ra_directory:unregister_name(Names, UId),
             catch ra_log_meta:delete_sync(MetaName, UId),
             catch ets:delete(ra_state, UId),
+            catch ets:delete(ra_non_voters, UId),
             catch ra_counters:delete(Id),
             Self = self(),
             %% we have to terminate the child spec from the supervisor as it
@@ -1004,6 +997,7 @@ terminate(Reason, StateName,
     end,
     _ = ets:delete(ra_metrics, MetricsKey),
     _ = ets:delete(ra_state, Key),
+    _ = ets:delete(ra_non_voters, Key),
     ok.
 
 code_change(_OldVsn, StateName, State, _Extra) ->
@@ -1037,8 +1031,7 @@ format_status(Opt, [_PDict, StateName,
 handle_enter(RaftState, OldRaftState,
              #state{conf = #conf{name = Name},
                     server_state = ServerState0} = State) ->
-    Voter = ra_server:voter_status(ServerState0),
-    true = ets:insert(ra_state, {Name, RaftState, Voter}),
+    true = ets:insert(ra_state, {Name, RaftState}),
     {ServerState, Effects} = ra_server:handle_state_enter(RaftState,
                                                           ServerState0),
     case RaftState == leader orelse OldRaftState == leader of
@@ -1726,11 +1719,9 @@ handle_tick_metrics(State) ->
     _ = ets:insert(ra_metrics, Metrics),
     State.
 
-can_execute_locally(RaftState, TargetNode,
-                    #state{server_state = ServerState} = State) ->
-    Voter = ra_server:voter_status(ServerState),
+can_execute_locally(RaftState, TargetNode, State) ->
     case RaftState of
-        follower when Voter =:= voter ->
+        follower ->
             TargetNode == node();
         leader when TargetNode =/= node() ->
             %% We need to evaluate whether to send the message.

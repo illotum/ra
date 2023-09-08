@@ -13,6 +13,7 @@
 
 -define(TABLES, [ra_metrics,
                  ra_state,
+                 ra_non_voters,
                  ra_open_file_metrics,
                  ra_io_metrics
                  ]).

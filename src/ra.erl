@@ -455,7 +455,7 @@ start_cluster(System, [#{cluster_name := ClusterName} | _] = ServerConfigs,
 
 %% @doc Starts a new distributed ra cluster.
 %% @param ClusterName the name of the cluster.
-%% @param ServerId the ra_server_id() of the server, or a map with server id and settings.
+%% @param ServerId the ra_server_id() of the server
 %% @param Machine The {@link ra_machine:machine/0} configuration.
 %% @param ServerIds a list of initial (seed) server configurations
 %% @returns
@@ -470,13 +470,10 @@ start_cluster(System, [#{cluster_name := ClusterName} | _] = ServerConfigs,
 %% forcefully deleted.
 %% @see start_server/1
 %% @end
--spec start_server(atom(), ra_cluster_name(), ra_server_id() | ra_new_server(),
+-spec start_server(atom(), ra_cluster_name(), ra_server_id(),
                    ra_server:machine_conf(), [ra_server_id()]) ->
     ok | {error, term()}.
-start_server(System, ClusterName, {_, _} = ServerId, Machine, ServerIds) ->
-    % Legacy start server, default to full voter
-    start_server(System, ClusterName, #{id => ServerId, voter => true}, Machine, ServerIds);
-start_server(System, ClusterName, #{id := {_, _} = ServerId, voter := Voter}, Machine, ServerIds)
+start_server(System, ClusterName, {_, _} = ServerId, Machine, ServerIds)
   when is_atom(System) ->
     UId = new_uid(ra_lib:to_binary(ClusterName)),
     Conf = #{cluster_name => ClusterName,
@@ -484,7 +481,6 @@ start_server(System, ClusterName, #{id := {_, _} = ServerId, voter := Voter}, Ma
              uid => UId,
              initial_members => ServerIds,
              log_init_args => #{uid => UId},
-             voter => Voter,
              machine => Machine},
     start_server(System, Conf).
 
@@ -744,6 +740,7 @@ overview(System) ->
                          closed_mem_tbls := ClosedTbls,
                          wal := Wal}} = Config,
             #{node => node(),
+              known_non_voters => ets:tab2list(ra_non_voters),
               servers => ra_directory:overview(System),
               %% TODO:filter counter keys by system
               counters => ra_counters:overview(),
@@ -1137,16 +1134,13 @@ key_metrics({Name, N} = ServerId) when N == node() ->
                end,
     case whereis(Name) of
         undefined ->
-            Counters#{state => noproc,
-                      voter_status => unknown};
+            Counters#{state => noproc};
         _ ->
             case ets:lookup(ra_state, Name) of
                 [] ->
-                    Counters#{state => unknown,
-                              voter_status => unknown};
-                [{_, State, Voter}] ->
-                    Counters#{state => State,
-                              voter_status => Voter}
+                    Counters#{state => unknown};
+                [{_, State}] ->
+                    Counters#{state => State}
             end
     end;
 key_metrics({_, N} = ServerId) ->

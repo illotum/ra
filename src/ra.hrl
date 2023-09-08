@@ -50,7 +50,7 @@
 
 -type ra_voter_status() :: voter | {nonvoter, ra_nonvoter_reason()}.
 
--type ra_nonvoter_reason() :: init | #{target := ra_index()}.
+-type ra_nonvoter_reason() :: #{target := ra_index()}.
 
 -type ra_peer_state() :: #{next_index := non_neg_integer(),
                            match_index := non_neg_integer(),
@@ -128,6 +128,7 @@
 %% Section 4.2
 -record(request_vote_result,
         {term :: ra_term(),
+         from :: ra_server_id(),
          vote_granted :: boolean()}).
 
 %% pre-vote extension
@@ -143,13 +144,14 @@
 
 -record(pre_vote_result,
         {term :: ra_term(),
+         from :: ra_server_id(),
          token :: reference(),
          vote_granted :: boolean()}).
 
 -type snapshot_meta() :: #{index := ra_index(),
                            term := ra_term(),
-                           cluster := ra_cluster_servers(),
-                           non_voters => ra_cluster_servers(),
+                           cluster := ra_cluster_servers(),  %% TODO deprecate in favour of 'members'.
+                           members => #{ra_server_id() := #{voter_status => ra_voter_status()}},
                            machine_version := ra_machine:version()}.
 
 -record(install_snapshot_rpc,

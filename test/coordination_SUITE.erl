@@ -410,14 +410,14 @@ nonvoter_catches_up(Config) ->
 
     New = #{id => C, voter => false},
     {ok, _, _} = ra:add_member(A, New),
-    ok = ra:start_server(?SYS, ClusterName, New, Machine, [A, B]),
-    ?assertMatch({ok, #{voter_status := {nonvoter, _}}, _},
-                 ra:member_overview(C)),
+    ok = ra:start_server(?SYS, ClusterName, C, Machine, [A, B]),
+    ?assertMatch({ok, #{cluster := #{C := #{voter_status := {nonvoter, _}}}}, _},
+                 ra:member_overview(A)),
 
     await_condition(
       fun () ->
-          {ok, O2, _} = ra:member_overview(C),
-          voter == maps:get(voter_status, O2)
+          {ok, #{cluster := #{C := Peer}}, _} = ra:member_overview(A),
+          voter == maps:get(voter_status, Peer)
       end, 200),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],
@@ -437,16 +437,16 @@ nonvoter_catches_up_after_restart(Config) ->
 
     New = #{id => C, voter => false},
     {ok, _, _} = ra:add_member(A, New),
-    ok = ra:start_server(?SYS, ClusterName, New, Machine, [A, B]),
-    ?assertMatch({ok, #{voter_status := {nonvoter, _}}, _},
-                 ra:member_overview(C)),
+    ok = ra:start_server(?SYS, ClusterName, C, Machine, [A, B]),
+    ?assertMatch({ok, #{cluster := #{C := #{voter_status := {nonvoter, _}}}}, _},
+                 ra:member_overview(A)),
     ok = ra:stop_server(?SYS, C),
     ok = ra:restart_server(?SYS, C),
 
     await_condition(
       fun () ->
-          {ok, O2, _} = ra:member_overview(C),
-          voter == maps:get(voter_status, O2)
+          {ok, #{cluster := #{C := Peer}}, _} = ra:member_overview(A),
+          voter == maps:get(voter_status, Peer)
       end, 200),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],
@@ -466,16 +466,16 @@ nonvoter_catches_up_after_leader_restart(Config) ->
 
     New = #{id => C, voter => false},
     {ok, _, _} = ra:add_member(A, New),
-    ok = ra:start_server(?SYS, ClusterName, New, Machine, [A, B]),
-    ?assertMatch({ok, #{voter_status := {nonvoter, _}}, _},
-                 ra:member_overview(C)),
+    ok = ra:start_server(?SYS, ClusterName, C, Machine, [A, B]),
+    ?assertMatch({ok, #{cluster := #{C := #{voter_status := {nonvoter, _}}}}, _},
+                 ra:member_overview(A)),
     ok = ra:stop_server(?SYS, Leader),
     ok = ra:restart_server(?SYS, Leader),
 
     await_condition(
       fun () ->
-          {ok, O2, _} = ra:member_overview(C),
-          voter == maps:get(voter_status, O2)
+          {ok, #{cluster := #{C := Peer}}, _} = ra:member_overview(A),
+          voter == maps:get(voter_status, Peer)
       end, 200),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],

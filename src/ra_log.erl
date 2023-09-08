@@ -638,17 +638,16 @@ update_release_cursor0(Idx, Cluster, MacVersion, MacState,
                                 reader = Reader,
                                 snapshot_state = SnapState} = State0) ->
     ClusterServerIds = maps:keys(Cluster),
-    NonvoterIds = maps:fold(fun
-                              (K, #{voter_status := {nonvoter, _}}, Acc) -> [K|Acc];
-                              (_, _, Acc) -> Acc
-                            end, [], Cluster),
+    Members = maps:map(fun(_, V) ->
+                           maps:with([voter_status], V)
+                       end, Cluster),
     SnapLimit = case ra_snapshot:current(SnapState) of
                     undefined -> SnapInter;
                     {I, _} -> I + SnapInter
                 end,
     Meta = #{index => Idx,
              cluster => ClusterServerIds,
-             non_voters => NonvoterIds,
+             members => Members,
              machine_version => MacVersion},
     % The release cursor index is the last entry _not_ contributing
     % to the current state. I.e. the last entry that can be discarded.

@@ -279,10 +279,6 @@ election_timeout(_Config) ->
         {N3, _}]}]} =
         ra_server:handle_follower(Msg, State),
 
-    % non-voters ignore election_timeout
-    NVState = State#{voter_status => {nonvoter, test}},
-    {follower, NVState, []} = ra_server:handle_follower(Msg, NVState),
-
     % pre_vote
     {pre_vote, #{current_term := 5, votes := 0,
                  pre_vote_token := Token1},
@@ -303,7 +299,7 @@ election_timeout(_Config) ->
     VoteRpc = #request_vote_rpc{term = 6, candidate_id = N1,
                                 last_log_index = 3, last_log_term = 5},
     VoteForSelfEvent = {next_event, cast,
-                        #request_vote_result{term = 6, vote_granted = true}},
+                        #request_vote_result{term = 6, from = N1, vote_granted = true}},
     {candidate, #{current_term := 6, votes := 0},
      [VoteForSelfEvent, {send_vote_requests, [{N2, VoteRpc}, {N3, VoteRpc}]}]} =
         ra_server:handle_candidate(Msg, State),
@@ -1010,10 +1006,6 @@ follower_request_vote(_Config) ->
     ra_server:handle_follower(Msg#request_vote_rpc{last_log_index = 4},
                             State),
 
-    % non-voters ignore request_vote_rpc
-    NVState = State#{voter_status => {nonvoter, test}},
-    {follower, NVState, []} = ra_server:handle_follower(Msg, NVState),
-
      ok.
 
 follower_pre_vote(_Config) ->
@@ -1129,10 +1121,6 @@ follower_pre_vote(_Config) ->
     ra_server:handle_follower(Msg#pre_vote_rpc{last_log_index = 4},
                               State),
 
-    % non-voters ignore pre_vote_rpc
-    NVState = State#{voter_status => {nonvoter, test}},
-    {follower, NVState, []} = ra_server:handle_follower(Msg, NVState),
-
     ok.
 
 pre_vote_receives_pre_vote(_Config) ->
@@ -1219,6 +1207,28 @@ leader_replies_to_append_entries_rpc_with_lower_term(_Config) ->
 
     ok.
 
+% nonvoter_rpc(_Config) ->
+%     N2 = ?N2, N3 = ?N3,
+%     State = #{log := Log} = base_state(3, ?FUNCTION_NAME),
+%     AEReply = {N2, #append_entries_reply{term = 5, success = true,
+%                                          next_index = 4,
+%                                          last_index = 3, last_term = 5}},
+%     {follower, #{current_term := IncomingTerm, leader_id := undefined}, []} =
+%         ra_server:handle_leader(AEReply, State),
+%
+%     Token = make_ref(),
+%     PreVoteRply = {N2, #pre_vote_result{term = 5, vote_granted = true,
+%                                         from = N2, token = Token}},
+%     {follower, #{current_term := IncomingTerm, leader_id := undefined}, []} =
+%         ra_server:handle_leader(AEReply, State),
+%
+%     RequestVoteReply = {N2, #request_vote_result{term = 5, vote_granted = true,
+%                                          last_index = 3, last_term = 5}},
+%     {follower, #{current_term := IncomingTerm, leader_id := undefined}, []} =
+%         ra_server:handle_leader(AEReply, State),
+%
+%     ok.
+%
 higher_term_detected(_Config) ->
     N2 = ?N2, N3 = ?N3,
     % Any message received with a higher term should result in the
@@ -1403,7 +1413,6 @@ leader_server_join(_Config) ->
     % raft servers should switch to the new configuration after log append
     % and further cluster changes should be disallowed
     {leader, #{cluster := #{N1 := _, N2 := _, N3 := _, N4 := _},
-               commit_index := Target,
                cluster_change_permitted := false} = _State1, Effects} =
         ra_server:handle_leader({command, {'$ra_join', meta(),
                                            N4, await_consensus}}, State0),
@@ -1734,10 +1743,19 @@ command_notify(_Config) ->
 
 candidate_election(_Config) ->
     N2 = ?N2, N3 = ?N3, N4 = ?N4, N5 = ?N5,
-    State = (base_state(5, ?FUNCTION_NAME))#{current_term => 6, votes => 1},
+    State0 = (base_state(5, ?FUNCTION_NAME))#{current_term => 6, votes => 1},
+    State = set_peer_voter_status(State0, N5, {nonvoter, test}),
     Reply = #request_vote_result{term = 6, vote_granted = true},
     {candidate, #{votes := 2} = State1, []}
         = ra_server:handle_candidate(Reply, State),
+    % with from
+    ReplyFrom = #request_vote_result{term = 6, from = N4, vote_granted = true},
+    {candidate, #{votes := 2} = State1, []}
+        = ra_server:handle_candidate(ReplyFrom, State),
+    % nonvoter is ignored
+    ReplyFromNonvoter = #request_vote_result{term = 6, from = N5, vote_granted = true},
+    {candidate, #{votes := 1} = State, []}
+        = ra_server:handle_candidate(ReplyFromNonvoter, State),
     % denied
     NegResult = #request_vote_result{term = 6, vote_granted = false},
     {candidate, #{votes := 2}, []}
@@ -1753,13 +1771,14 @@ candidate_election(_Config) ->
     % quorum has been achieved - candidate becomes leader
     PeerState = new_peer_with(#{next_index => 3+1, % leaders last log index + 1
                                 match_index => 0}), % initd to 0
+    NonvoterState = PeerState#{voter_status := {nonvoter, test}},
     % when candidate becomes leader the next operation should be a noop
     % and all peers should be initialised with the appropriate state
     % Also rpcs for all members should be issued
     {leader, #{cluster := #{N2 := PeerState,
                             N3 := PeerState,
                             N4 := PeerState,
-                            N5 := PeerState}},
+                            N5 := NonvoterState}},
      [
       {next_event, cast, {command, {noop, _, MacVer}}},
       {send_rpc, _, _},
@@ -1769,12 +1788,24 @@ candidate_election(_Config) ->
      ]} = ra_server:handle_candidate(Reply, State1).
 
 pre_vote_election(_Config) ->
+    N4 = ?N4, N5 = ?N5,
     Token = make_ref(),
-    State = (base_state(5, ?FUNCTION_NAME))#{votes => 1,
+    State0 = (base_state(5, ?FUNCTION_NAME))#{votes => 1,
                              pre_vote_token => Token},
+    State = set_peer_voter_status(State0, N5, {nonvoter, test}),
     Reply = #pre_vote_result{term = 5, token = Token, vote_granted = true},
     {pre_vote, #{votes := 2} = State1, []}
         = ra_server:handle_pre_vote(Reply, State),
+
+    % with from
+    ReplyFrom = #pre_vote_result{term = 5, token = Token, from = N4, vote_granted = true},
+    {pre_vote, #{votes := 2} = State1, []}
+        = ra_server:handle_pre_vote(ReplyFrom, State),
+
+    % nonvoter is ignored
+    ReplyFromNonvoter = #pre_vote_result{term = 5, token = Token, from = N5, vote_granted = true},
+    {pre_vote, #{votes := 1} = State, []}
+        = ra_server:handle_pre_vote(ReplyFromNonvoter, State),
 
     %% different token is ignored
     {pre_vote, #{votes := 1}, []}

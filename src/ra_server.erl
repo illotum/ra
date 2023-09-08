@@ -73,7 +73,6 @@
       log := term(),
       voted_for => 'maybe'(ra_server_id()), % persistent
       votes => non_neg_integer(),
-      voter_status => ra_voter_status(),
       commit_index := ra_index(),
       last_applied := ra_index(),
       persisted_last_applied => ra_index(),
@@ -295,25 +294,22 @@ init(#{id := Id,
 
     LatestMacVer = ra_machine:version(Machine),
 
-    {Cluster, VoterStatus,
-     MacVer, MacState,
+    {_FirstIndex, Cluster0, MacVer, MacState,
      {SnapshotIdx, _} = SnapshotIndexTerm} =
         case ra_log:recover_snapshot(Log0) of
             undefined ->
                 InitialMachineState = ra_machine:init(Machine, Name),
-                Voter = case maps:get(voter, Config, true) of
-                          false ->
-                              new_nonvoter(init);
-                          true ->
-                              voter
-                        end,
-                {make_cluster(Id, InitialNodes), Voter, 0, InitialMachineState, {0, 0}};
-            {#{index := Idx, term := Term,
+                {0, make_cluster(Id, InitialNodes),
+                 0, InitialMachineState, {0, 0}};
+            {#{index := Idx,
+               term := Term,
                cluster := ClusterNodes,
                machine_version := MacVersion} = Snapshot, MacSt} ->
-                Nonvoters = maps:get(non_voters, Snapshot, []),
-                Clu = make_cluster(Id, ClusterNodes, Nonvoters, snapshot),
-                {Clu, voter_status(Id, Clu), MacVersion, MacSt, {Idx, Term}}
+                Nodes = maps:get(members, Snapshot, ClusterNodes),
+                Clu = make_cluster(Id, Nodes),
+                %% the snapshot is the last index before the first index
+                %% TODO: should this be Idx + 1?
+                {Idx + 1, Clu, MacVersion, MacSt, {Idx, Term}}
         end,
     MacMod = ra_machine:which_module(Machine, MacVer),
 
@@ -337,7 +333,7 @@ init(#{id := Id,
 
     #{cfg => Cfg,
       current_term => CurrentTerm,
-      cluster => Cluster,
+      cluster => Cluster0,
       % There may be scenarios when a single server
       % starts up but hasn't
       % yet re-applied its noop command that we may receive other join
@@ -345,7 +341,6 @@ init(#{id := Id,
       cluster_change_permitted => false,
       cluster_index_term => SnapshotIndexTerm,
       voted_for => VotedFor,
-      voter_status => VoterStatus,
       commit_index => CommitIndex,
       %% set this to the first index so that we can apply all entries
       %% up to the commit index during recovery
@@ -716,7 +711,7 @@ handle_leader(#request_vote_rpc{term = Term, candidate_id = Cand} = Msg,
              [{next_event, Msg}]}
     end;
 handle_leader(#request_vote_rpc{}, State = #{current_term := Term}) ->
-    Reply = #request_vote_result{term = Term, vote_granted = false},
+    Reply = #request_vote_result{term = Term, from = id(State), vote_granted = false},
     {leader, State, [{reply, Reply}]};
 handle_leader(#pre_vote_rpc{term = Term, candidate_id = Cand} = Msg,
               #{current_term := CurTerm,
@@ -780,27 +775,34 @@ handle_leader(Msg, State) ->
 
 -spec handle_candidate(ra_msg() | election_timeout, ra_server_state()) ->
     {ra_state(), ra_server_state(), effects()}.
-handle_candidate(#request_vote_result{term = Term, vote_granted = true},
+handle_candidate(#request_vote_result{term = Term, from = RemoteId, vote_granted = true},
                  #{cfg := #cfg{id = Id,
                                log_id = LogId,
                                machine = Mac},
                    current_term := Term,
                    votes := Votes,
                    cluster := Nodes} = State0) ->
-    NewVotes = Votes + 1,
-    ?DEBUG("~ts: vote granted for term ~b votes ~b",
-          [LogId, Term, NewVotes]),
-    case required_quorum(Nodes) of
+  case voter_status(RemoteId, Nodes) of
+    {nonvoter, _} ->
+      ?DEBUG("~ts: vote granted for term ~b (~ts is non-voter) votes ~b",
+             [LogId, Term, RemoteId, Votes]),
+      {candidate, State0, []};
+    _ ->  % voter | undefined
+      NewVotes = Votes + 1,
+      ?DEBUG("~ts: vote granted for term ~b votes ~b",
+             [LogId, Term, NewVotes]),
+      case required_quorum(Nodes) of
         NewVotes ->
-            {State1, Effects} = make_all_rpcs(initialise_peers(State0)),
-            Noop = {noop, #{ts => erlang:system_time(millisecond)},
-                    ra_machine:version(Mac)},
-            State = State1#{leader_id => Id},
-            {leader, maps:without([votes], State),
-             [{next_event, cast, {command, Noop}} | Effects]};
+          {State1, Effects} = make_all_rpcs(initialise_peers(State0)),
+          Noop = {noop, #{ts => erlang:system_time(millisecond)},
+                  ra_machine:version(Mac)},
+          State = State1#{leader_id => Id},
+          {leader, maps:without([votes], State),
+           [{next_event, cast, {command, Noop}} | Effects]};
         _ ->
-            {candidate, State0#{votes => NewVotes}, []}
-    end;
+          {candidate, State0#{votes => NewVotes}, []}
+      end
+  end;
 handle_candidate(#request_vote_result{term = Term},
                  #{current_term := CurTerm,
                    cfg := #cfg{log_id = LogId}} = State0)
@@ -862,7 +864,7 @@ handle_candidate(#pre_vote_rpc{term = Term} = Msg,
     State = update_term_and_voted_for(Term, undefined, State0),
     {follower, State, [{next_event, Msg}]};
 handle_candidate(#request_vote_rpc{}, State = #{current_term := Term}) ->
-    Reply = #request_vote_result{term = Term, vote_granted = false},
+    Reply = #request_vote_result{term = Term, from = id(State), vote_granted = false},
     {candidate, State, [{reply, Reply}]};
 handle_candidate(#pre_vote_rpc{}, State) ->
     %% just ignore pre_votes that aren't of a higher term
@@ -926,22 +928,30 @@ handle_pre_vote(#install_snapshot_rpc{term = Term} = ISR,
   when Term >= CurTerm ->
     {follower, State0#{votes => 0}, [{next_event, ISR}]};
 handle_pre_vote(#pre_vote_result{term = Term, vote_granted = true,
+                                 from = RemoteId,
                                  token = Token},
                 #{current_term := Term,
                   votes := Votes,
                   cfg := #cfg{log_id = LogId},
                   pre_vote_token := Token,
                   cluster := Nodes} = State0) ->
-    ?DEBUG("~ts: pre_vote granted ~w for term ~b votes ~b",
-          [LogId, Token, Term, Votes + 1]),
-    NewVotes = Votes + 1,
-    State = update_term(Term, State0),
-    case required_quorum(Nodes) of
-        NewVotes ->
-            call_for_election(candidate, State);
-        _ ->
-            {pre_vote, State#{votes => NewVotes}, []}
-    end;
+  case voter_status(RemoteId, Nodes) of
+    {nonvoter, _} ->
+      ?DEBUG("~ts: pre_vote granted ~w for term ~b (~ts is non-voter) votes ~b",
+            [LogId, Token, Term, RemoteId, Votes]),
+      {pre_vote, State0, []};
+    _ ->  % voter | undefined
+      ?DEBUG("~ts: pre_vote granted ~w for term ~b votes ~b",
+            [LogId, Token, Term, Votes + 1]),
+      NewVotes = Votes + 1,
+      State = update_term(Term, State0),
+      case required_quorum(Nodes) of
+          NewVotes ->
+              call_for_election(candidate, State);
+          _ ->
+              {pre_vote, State#{votes => NewVotes}, []}
+      end
+  end;
 handle_pre_vote(#pre_vote_result{vote_granted = false}, State) ->
     %% just handle negative results to avoid printing an unhandled message log
     {pre_vote, State, []};
@@ -1118,18 +1128,8 @@ handle_follower({ra_log_event, Evt}, State = #{log := Log0}) ->
     % simply forward all other events to ra_log
     {Log, Effects} = ra_log:handle_event(Evt, Log0),
     {follower, State#{log => Log}, Effects};
-handle_follower(#pre_vote_rpc{},
-                #{cfg := #cfg{log_id = LogId}, voter_status := {nonvoter, _} = Voter} = State) ->
-    ?DEBUG("~s: follower ignored pre_vote_rpc, non-voter: ~p0",
-           [LogId, Voter]),
-    {follower, State, []};
 handle_follower(#pre_vote_rpc{} = PreVote, State) ->
     process_pre_vote(follower, PreVote, State);
-handle_follower(#request_vote_rpc{},
-                #{cfg := #cfg{log_id = LogId}, voter_status := {nonvoter, _} = Voter} = State) ->
-    ?DEBUG("~s: follower ignored request_vote_rpc, non-voter: ~p0",
-           [LogId, Voter]),
-    {follower, State, []};
 handle_follower(#request_vote_rpc{candidate_id = Cand, term = Term},
                 #{current_term := Term, voted_for := VotedFor,
                   cfg := #cfg{log_id = LogId}} = State)
@@ -1137,7 +1137,7 @@ handle_follower(#request_vote_rpc{candidate_id = Cand, term = Term},
     % already voted for another in this term
     ?DEBUG("~w: follower request_vote_rpc for ~w already voted for ~w in ~b",
            [LogId, Cand, VotedFor, Term]),
-    Reply = #request_vote_result{term = Term, vote_granted = false},
+    Reply = #request_vote_result{term = Term, from = id(State), vote_granted = false},
     {follower, State, [{reply, Reply}]};
 handle_follower(#request_vote_rpc{term = Term, candidate_id = Cand,
                                   last_log_index = LLIdx,
@@ -1152,7 +1152,7 @@ handle_follower(#request_vote_rpc{term = Term, candidate_id = Cand,
             ?INFO("~ts: granting vote for ~w with last indexterm ~w"
                   " for term ~b previous term was ~b",
                   [LogId, Cand, {LLIdx, LLTerm}, Term, CurTerm]),
-            Reply = #request_vote_result{term = Term, vote_granted = true},
+            Reply = #request_vote_result{term = Term, from = id(State0), vote_granted = true},
             State = update_term_and_voted_for(Term, Cand, State1),
             {follower, State, [{reply, Reply}]};
         false ->
@@ -1160,7 +1160,7 @@ handle_follower(#request_vote_rpc{term = Term, candidate_id = Cand,
                   " candidate last log index term was: ~w~n"
                   " last log entry idxterm seen was: ~w",
                   [LogId, Cand, Term, {LLIdx, LLTerm}, {LastIdxTerm}]),
-            Reply = #request_vote_result{term = Term, vote_granted = false},
+            Reply = #request_vote_result{term = Term, from = id(State0), vote_granted = false},
             {follower, update_term(Term, State1), [{reply, Reply}]}
     end;
 handle_follower(#request_vote_rpc{term = Term, candidate_id = Candidate},
@@ -1169,7 +1169,7 @@ handle_follower(#request_vote_rpc{term = Term, candidate_id = Candidate},
   when Term < CurTerm ->
     ?INFO("~ts: declining vote to ~w for term ~b, current term ~b",
           [LogId, Candidate, Term, CurTerm]),
-    Reply = #request_vote_result{term = CurTerm, vote_granted = false},
+    Reply = #request_vote_result{term = CurTerm, from = id(State), vote_granted = false},
     {follower, State, [{reply, Reply}]};
 handle_follower({_PeerId, #append_entries_reply{term = TheirTerm}},
                 State = #{current_term := CurTerm}) ->
@@ -1225,12 +1225,6 @@ handle_follower(#pre_vote_result{}, State) ->
 handle_follower(#append_entries_reply{}, State) ->
     %% handle to avoid logging as unhandled
     %% could receive a lot of these shortly after standing down as leader
-    {follower, State, []};
-handle_follower(election_timeout,
-                #{cfg := #cfg{log_id = LogId},
-                  voter_status := {nonvoter, _} = Voter} = State) ->
-    ?DEBUG("~s: follower ignored election_timeout, non-voter: ~p0",
-           [LogId, Voter]),
     {follower, State, []};
 handle_follower(election_timeout, State) ->
     call_for_election(pre_vote, State);
@@ -1291,14 +1285,15 @@ handle_receive_snapshot(#install_snapshot_rpc{term = Term,
                           Cfg0
                   end,
 
-            {#{cluster := ClusterIds} = Snapshot, MacState} = ra_log:recover_snapshot(Log),
-            Nonvoters = maps:get(non_voters, Snapshot, []),
+            {#{cluster := ClusterNodes} = Snapshot, MacState} = ra_log:recover_snapshot(Log),
+            Nodes = maps:get(members, Snapshot, ClusterNodes),
+            Clu = make_cluster(Id, Nodes),
             State = update_term(Term,
                                 State0#{cfg => Cfg,
                                         log => Log,
                                         commit_index => SnapIndex,
                                         last_applied => SnapIndex,
-                                        cluster => make_cluster(Id, ClusterIds, Nonvoters, remote_snapshot),
+                                        cluster => Clu,
                                         machine_state => MacState}),
             %% it was the last snapshot chunk so we can revert back to
             %% follower status
@@ -2021,7 +2016,7 @@ call_for_election(candidate, #{cfg := #cfg{id = Id, log_id = LogId} = Cfg,
                                        last_log_term = LastTerm}}
             || PeerId <- PeerIds],
     % vote for self
-    VoteForSelf = #request_vote_result{term = NewTerm, vote_granted = true},
+    VoteForSelf = #request_vote_result{term = NewTerm, from = Id, vote_granted = true},
     State = update_term_and_voted_for(NewTerm, Id, State0),
     {candidate, State#{leader_id => undefined, votes => 0},
      [{next_event, cast, VoteForSelf},
@@ -2068,7 +2063,7 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
         true when Version > ?RA_PROTO_VERSION->
             ?DEBUG("~ts: declining pre-vote for ~w for protocol version ~b",
                    [log_id(State0), Cand, Version]),
-            {FsmState, State, [{reply, pre_vote_result(Term, Token, false)}]};
+            {FsmState, State, [{reply, pre_vote_result(Term, id(State), Token, false)}]};
         true when TheirMacVer == EffMacVer orelse
                   (TheirMacVer >= EffMacVer andalso
                    TheirMacVer =< OurMacVer) ->
@@ -2079,12 +2074,12 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                    [log_id(State0), Cand, TheirMacVer, OurMacVer, EffMacVer,
                     {LLIdx, LLTerm}, Term, CurTerm]),
             {FsmState, State#{voted_for => Cand},
-             [{reply, pre_vote_result(Term, Token, true)}]};
+             [{reply, pre_vote_result(Term, id(State), Token, true)}]};
         true ->
             ?DEBUG("~ts: declining pre-vote for ~w their machine version ~b"
                    " ours is ~b effective ~b",
                    [log_id(State0), Cand, TheirMacVer, OurMacVer, EffMacVer]),
-            {FsmState, State, [{reply, pre_vote_result(Term, Token, false)},
+            {FsmState, State, [{reply, pre_vote_result(Term, id(State), Token, false)},
                                start_election_timeout]};
         false ->
             ?DEBUG("~ts: declining pre-vote for ~w for term ~b,"
@@ -2096,7 +2091,7 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term, candidate_id = Cand,
                     {FsmState, State, [start_election_timeout]};
                 _ ->
                     {FsmState, State,
-                     [{reply, pre_vote_result(Term, Token, false)}]}
+                     [{reply, pre_vote_result(Term, id(State), Token, false)}]}
             end
     end;
 process_pre_vote(FsmState, #pre_vote_rpc{term = Term,
@@ -2107,10 +2102,11 @@ process_pre_vote(FsmState, #pre_vote_rpc{term = Term,
     ?DEBUG("~ts declining pre-vote to ~w for term ~b, current term ~b",
            [log_id(State), Candidate, Term, CurTerm]),
     {FsmState, State,
-     [{reply, pre_vote_result(CurTerm, Token, false)}]}.
+     [{reply, pre_vote_result(CurTerm, id(State), Token, false)}]}.
 
-pre_vote_result(Term, Token, Success) ->
+pre_vote_result(Term, From, Token, Success) ->
     #pre_vote_result{term = Term,
+                     from = From,
                      token = Token,
                      vote_granted = Success}.
 
@@ -2240,16 +2236,20 @@ fetch_term(Idx, #{log := Log0} = State) ->
             {Term, State#{log => Log}}
     end.
 
-make_cluster(Self, Nodes) ->
-  make_cluster(Self, Nodes, [], all_voters).
-
-make_cluster(Self, Nodes, Nonvoters, Reason) ->
+make_cluster(Self, Nodes) when is_list(Nodes) ->
     case lists:foldl(fun(N, Acc) ->
-                         P = case lists:member(N, Nonvoters) of
-                               true -> new_nonvoter(Reason);
-                               false -> new_peer()
-                             end,
-                         Acc#{N =>P}
+                         Acc#{N => new_peer()}
+                     end, #{}, Nodes) of
+        #{Self := _} = Cluster ->
+            % current server is already in cluster - do nothing
+            Cluster;
+        Cluster ->
+            % add current server to cluster
+            Cluster#{Self => new_peer()}
+    end;
+make_cluster(Self, Nodes) when is_map(Nodes) ->
+    case maps:fold(fun(K, V, Acc) ->
+                         Acc#{K => new_peer_with(V)}
                      end, #{}, Nodes) of
         #{Self := _} = Cluster ->
             % current server is already in cluster - do nothing
@@ -2574,7 +2574,6 @@ pre_append_log_follower({Idx, Term, Cmd} = Entry,
 pre_append_log_follower({Idx, Term, {'$ra_cluster_change', _, Cluster, _}},
                         State) ->
     State#{cluster => Cluster,
-           voter_status => voter_status(id(State), Cluster),
            cluster_index_term => {Idx, Term}};
 pre_append_log_follower(_, State) ->
     State.
@@ -2584,6 +2583,17 @@ append_cluster_change(Cluster, From, ReplyMode,
                                 cluster := PrevCluster,
                                 cluster_index_term := {PrevCITIdx, PrevCITTerm},
                                 current_term := Term}) ->
+    %% TODO A bit dense.
+    maps:foreach(fun(K, #{voter_status := TargetStatus}) ->
+                     case maps:get(K, PrevCluster, #{voter_status => voter}) of
+                       #{voter_status := TargetStatus} ->
+                         ok;
+                       #{voter_status := voter} when TargetStatus =/= voter ->
+                         ets:insert(ra_non_voters, K);
+                       #{voter_status := {nonvoter, _}} when TargetStatus =:= voter ->
+                         ets:delete_object(ra_non_voters, K)
+                     end
+                 end, Cluster),
     % turn join command into a generic cluster change command
     % that include the new cluster configuration
     Command = {'$ra_cluster_change', From, Cluster, ReplyMode},
@@ -2928,13 +2938,8 @@ update_voter_status(Permanent, _) ->
     Permanent.
 
 -spec voter_status(ra_server_state()) -> ra_voter_status().
-voter_status(#{cluster := Cluster} = State) ->
-    case maps:get(voter_status, State, undefined) of
-        undefined ->
-            voter_status(id(State), Cluster);
-        Voter ->
-            Voter
-    end.
+voter_status(#{cfg := #cfg{id = Id}, cluster := Cluster} = _State) ->
+  voter_status(Id, Cluster).
 
 -spec voter_status(ra_server_id(), ra_cluster()) -> ra_voter_status().
 voter_status(PeerId, Cluster) ->
