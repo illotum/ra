@@ -39,10 +39,6 @@
 %% after node restart). Pids are not stable in this sense.
 -type ra_server_id() :: {Name :: atom(), Node :: node()}.
 
-%% Specifies server configuration for a new cluster member.
--type ra_new_server() :: #{id := ra_server_id(),
-                           voter := boolean()}.
-
 -type ra_peer_status() :: normal |
                           {sending_snapshot, pid()} |
                           suspended |

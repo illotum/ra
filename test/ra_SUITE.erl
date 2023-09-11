@@ -1037,22 +1037,26 @@ voter_gets_promoted_consistent_leader(Config) ->
     validate_state_on_node(N1, 1),
 
     % grow 1
-    ok = start_and_join_nonvoter(N1, N2),
+    ok = start_and_join(N1, N2),
     ?assertNotEqual(All, voters(ra:member_overview(Leader))),
+    #{known_non_voters := NonVoters2} = ra:overview(?SYS),
+    ?assertEqual([N2], NonVoters2),
     _ = issue_op(N2, 1),
     validate_state_on_node(N2, 2),
 
     % grow 2
-    ok = start_and_join_nonvoter(N1, N3),
+    ok = start_and_join(N1, N3),
     ?assertNotEqual(All, voters(ra:member_overview(Leader))),
+    #{known_non_voters := NonVoters3} = ra:overview(?SYS),
+    ?assertEqual([N3], NonVoters3),
     _ = issue_op(N3, 1),
     validate_state_on_node(N3, 3),
 
     % all are voters after catch-up
     timer:sleep(100),
     ?assertEqual(All, voters(ra:member_overview(Leader))),
-    #{known_non_voters := NonVoters} = ra:overview(?SYS),
-    ?assertEqual(All, All -- NonVoters),
+    #{known_non_voters := NonVotersFinal} = ra:overview(?SYS),
+    ?assertEqual(All, All -- NonVotersFinal),
     ok.
 
 voter_gets_promoted_new_leader(Config) ->
@@ -1066,7 +1070,7 @@ voter_gets_promoted_new_leader(Config) ->
     validate_state_on_node(N1, 1),
 
     % grow with leadership change
-    ok = start_and_join_nonvoter(N1, N3),
+    ok = start_and_join(N1, N3),
     ?assertNotEqual(All, voters(ra:member_overview(Leader))),
     ra:transfer_leadership(Leader, _Second),
     ?assertNotEqual(All, voters(ra:member_overview(Leader))),
@@ -1149,12 +1153,6 @@ add_member(Ref, New) ->
 
 start_and_join({ClusterName, _} = ServerRef, {_, _} = New) ->
     {ok, _, _} = ra:add_member(ServerRef, New),
-    ok = ra:start_server(default, ClusterName, New, add_machine(), [ServerRef]),
-    ok.
-
-start_and_join_nonvoter({ClusterName, _} = ServerRef, {_, _} = New) ->
-    Server = #{id => New, voter => false},
-    {ok, _, _} = ra:add_member(ServerRef, Server),
     ok = ra:start_server(default, ClusterName, New, add_machine(), [ServerRef]),
     ok.
 

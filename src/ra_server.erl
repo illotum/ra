@@ -2513,25 +2513,16 @@ append_log_leader({'$ra_join', From,
             Cluster = OldCluster#{JoiningNode => new_peer_with(#{voter_status => Voter})},
             append_cluster_change(Cluster, From, ReplyMode, State)
     end;
-append_log_leader({'$ra_join', From, #{id := JoiningNode,
-                                       voter := WantVoter}, ReplyMode},
-                  State) ->
-    % Shortcut to compute non-voter status
-    VoterStatus = case WantVoter of
-                      true -> voter;
-                      false -> new_nonvoter(State)
-                  end,
-    append_log_leader({'$ra_join', From, #{id => JoiningNode,
-                                           voter_status => VoterStatus}, ReplyMode},
-                      State);
 append_log_leader({'$ra_join', From, JoiningNode, ReplyMode},
                   State = #{cluster := OldCluster}) ->
-    % Legacy $ra_join, join as full voter iff no such member in the cluster.
+    % Legacy $ra_join, join as non voter iff no such member in the cluster.
     case OldCluster of
         #{JoiningNode := _} ->
             already_member(State);
         _ ->
-            append_log_leader({'$ra_join', From, #{id => JoiningNode, voter => true}, ReplyMode},
+            append_log_leader({'$ra_join', From,
+                               #{id => JoiningNode, voter_status => new_nonvoter(State)},
+                               ReplyMode},
                               State)
     end;
 append_log_leader({'$ra_leave', From, LeavingServer, ReplyMode},
@@ -2583,17 +2574,7 @@ append_cluster_change(Cluster, From, ReplyMode,
                                 cluster := PrevCluster,
                                 cluster_index_term := {PrevCITIdx, PrevCITTerm},
                                 current_term := Term}) ->
-    %% TODO A bit dense.
-    maps:foreach(fun(K, #{voter_status := TargetStatus}) ->
-                     case maps:get(K, PrevCluster, #{voter_status => voter}) of
-                       #{voter_status := TargetStatus} ->
-                         ok;
-                       #{voter_status := voter} when TargetStatus =/= voter ->
-                         ets:insert(ra_non_voters, K);
-                       #{voter_status := {nonvoter, _}} when TargetStatus =:= voter ->
-                         ets:delete_object(ra_non_voters, K)
-                     end
-                 end, Cluster),
+    update_known_non_voters(PrevCluster, Cluster),
     % turn join command into a generic cluster change command
     % that include the new cluster configuration
     Command = {'$ra_cluster_change', From, Cluster, ReplyMode},
@@ -2608,6 +2589,26 @@ append_cluster_change(Cluster, From, ReplyMode,
             cluster_change_permitted => false,
             cluster_index_term => IdxTerm,
             previous_cluster => {PrevCITIdx, PrevCITTerm, PrevCluster}}}.
+
+update_known_non_voters(OldCluster, NewCluster) ->
+  %% ra_non_voters table is used to report known non-voters from the leader perspecrtive.
+  maps:foreach(fun(K, V) ->
+                   OldV = maps:get(K, OldCluster, undefined),
+                   update_known_non_voter(K, OldV, V)
+               end, NewCluster),
+  Removed = maps:to_list(OldCluster) -- maps:to_list(NewCluster),
+  lists:foreach(fun({K, OldV})->
+                   update_known_non_voter(K, OldV, undefined)
+                end, Removed).
+
+update_known_non_voter(_Id, Peer, Peer) ->
+  ok;
+update_known_non_voter(Id, _OldPeer, undefined) ->
+  ets:delete_object(ra_non_voters, Id);
+update_known_non_voter(Id, _OldPeer, #{voter_status := voter}) ->
+  ets:delete_object(ra_non_voters, Id);
+update_known_non_voter(Id, _OldPeer, #{voter_status := _}) ->
+  ets:insert(ra_non_voters, Id).
 
 mismatch_append_entries_reply(Term, CommitIndex, State0) ->
     {CITerm, State} = fetch_term(CommitIndex, State0),

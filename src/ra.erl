@@ -23,6 +23,8 @@
          %% queries
          members/1,
          members/2,
+         cluster/1,
+         cluster/2,
          initial_members/1,
          initial_members/2,
          local_query/2,
@@ -558,10 +560,9 @@ delete_cluster(ServerIds, Timeout) ->
 %% affect said cluster's availability characteristics (by increasing quorum node count).
 %%
 %% @param ServerLoc the ra server or servers to try to send the command to
-%% @param ServerId the ra server id of the new server, or a map with server id and settings.
+%% @param ServerId the ra server id of the new server.
 %% @end
--spec add_member(ra_server_id() | [ra_server_id()],
-                 ra_server_id() | ra_new_server()) ->
+-spec add_member(ra_server_id() | [ra_server_id()], ra_server_id()) ->
     ra_cmd_ret() |
     {error, already_member} |
     {error, cluster_change_not_permitted}.
@@ -572,8 +573,7 @@ add_member(ServerLoc, ServerId) ->
 %% @see add_member/2
 %% @end
 -spec add_member(ra_server_id() | [ra_server_id()],
-                 ra_server_id() | ra_new_server(),
-                 timeout()) ->
+                 ra_server_id(), timeout()) ->
     ra_cmd_ret() |
     {error, already_member} |
     {error, cluster_change_not_permitted}.
@@ -1037,6 +1037,44 @@ members({local, ServerId}, Timeout) ->
     ra_server_proc:local_state_query(ServerId, members, Timeout);
 members(ServerId, Timeout) ->
     ra_server_proc:state_query(ServerId, members, Timeout).
+
+%% @doc Returns a map of cluster members to their status.
+%%
+%% Except if `{local, ServerId}' is passed, the query is sent to the specified
+%% server which may redirect it to the leader if it is a follower. It may
+%% timeout if there is currently no leader (i.e. an election is in progress).
+%%
+%% With `{local, ServerId}', the query is always handled by the specified
+%% server. It means the returned list might be out-of-date compared to what the
+%% leader would have returned.
+%%
+%% @param ServerId the Ra server(s) to send the query to
+%% @end
+-spec cluster(ra_server_id() | [ra_server_id()]) ->
+    ra_server_proc:ra_leader_call_ret(ra_cluster()).
+cluster(ServerId) ->
+    cluster(ServerId, ?DEFAULT_TIMEOUT).
+
+%% @doc Returns a map of cluster members to their status.
+%%
+%% Except if `{local, ServerId}' is passed, the query is sent to the specified
+%% server which may redirect it to the leader if it is a follower. It may
+%% timeout if there is currently no leader (i.e. an election is in progress).
+%%
+%% With `{local, ServerId}', the query is always handled by the specified
+%% server. It means the returned list might be out-of-date compared to what the
+%% leader would have returned.
+%%
+%% @param ServerId the Ra server(s) to send the query to
+%% @param Timeout the timeout to use
+%% @end
+-spec cluster(ra_server_id() | [ra_server_id()] | {local, ra_server_id()},
+              timeout()) ->
+    ra_server_proc:ra_leader_call_ret(ra_cluster()).
+cluster({local, ServerId}, Timeout) ->
+    ra_server_proc:local_state_query(ServerId, cluster, Timeout);
+cluster(ServerId, Timeout) ->
+    ra_server_proc:state_query(ServerId, cluster, Timeout).
 
 %% @doc Returns a list of initial (seed) cluster members.
 %%

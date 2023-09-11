@@ -399,7 +399,7 @@ disconnected_node_catches_up(Config) ->
 nonvoter_catches_up(Config) ->
     PrivDir = ?config(data_dir, Config),
     ClusterName = ?config(cluster_name, Config),
-    [A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
+    [{_, ANode} = A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
     Machine = {module, ?MODULE, #{}},
     {ok, Started, []} = ra:start_cluster(?SYS, ClusterName, Machine, [A, B]),
     {ok, _, Leader} = ra:members(hd(Started)),
@@ -408,17 +408,17 @@ nonvoter_catches_up(Config) ->
      || N <- lists:seq(1, 10000)],
     {ok, _, _} = ra:process_command(Leader, banana),
 
-    New = #{id => C, voter => false},
-    {ok, _, _} = ra:add_member(A, New),
+    {ok, _, _} = ra:add_member(A, C),
     ok = ra:start_server(?SYS, ClusterName, C, Machine, [A, B]),
-    ?assertMatch({ok, #{cluster := #{C := #{voter_status := {nonvoter, _}}}}, _},
-                 ra:member_overview(A)),
+    ?assertMatch({ok, #{C := #{voter_status := {nonvoter, _}}}, _}, ra:cluster(C)),
+    ?assertMatch(#{known_non_voters := [C]}, rpc:call(ANode, ra, overview,[?SYS])),
 
     await_condition(
       fun () ->
-          {ok, #{cluster := #{C := Peer}}, _} = ra:member_overview(A),
-          voter == maps:get(voter_status, Peer)
+          {ok, #{C := #{voter_status := Voter}}, _} = ra:cluster(C),
+          voter =:= Voter
       end, 200),
+    ?assertMatch(#{known_non_voters := []}, rpc:call(ANode, ra, overview,[?SYS])),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],
     ok.
@@ -426,7 +426,7 @@ nonvoter_catches_up(Config) ->
 nonvoter_catches_up_after_restart(Config) ->
     PrivDir = ?config(data_dir, Config),
     ClusterName = ?config(cluster_name, Config),
-    [A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
+    [{_, ANode} = A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
     Machine = {module, ?MODULE, #{}},
     {ok, Started, []} = ra:start_cluster(?SYS, ClusterName, Machine, [A, B]),
     {ok, _, Leader} = ra:members(hd(Started)),
@@ -435,19 +435,19 @@ nonvoter_catches_up_after_restart(Config) ->
      || N <- lists:seq(1, 10000)],
     {ok, _, _} = ra:process_command(Leader, banana),
 
-    New = #{id => C, voter => false},
-    {ok, _, _} = ra:add_member(A, New),
+    {ok, _, _} = ra:add_member(A, C),
     ok = ra:start_server(?SYS, ClusterName, C, Machine, [A, B]),
-    ?assertMatch({ok, #{cluster := #{C := #{voter_status := {nonvoter, _}}}}, _},
-                 ra:member_overview(A)),
+    ?assertMatch({ok, #{C := #{voter_status := {nonvoter, _}}}, _}, ra:cluster(C)),
+    ?assertMatch(#{known_non_voters := [C]}, rpc:call(ANode, ra, overview,[?SYS])),
     ok = ra:stop_server(?SYS, C),
     ok = ra:restart_server(?SYS, C),
 
     await_condition(
       fun () ->
-          {ok, #{cluster := #{C := Peer}}, _} = ra:member_overview(A),
-          voter == maps:get(voter_status, Peer)
+          {ok, #{C := #{voter_status := Voter}}, _} = ra:cluster(C),
+          voter =:= Voter
       end, 200),
+    ?assertMatch(#{known_non_voters := []}, rpc:call(ANode, ra, overview,[?SYS])),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],
     ok.
@@ -455,7 +455,7 @@ nonvoter_catches_up_after_restart(Config) ->
 nonvoter_catches_up_after_leader_restart(Config) ->
     PrivDir = ?config(data_dir, Config),
     ClusterName = ?config(cluster_name, Config),
-    [A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
+    [{_, ANode} = A, B, C] = ServerIds = [{ClusterName, start_follower(N, PrivDir)} || N <- [s1,s2,s3]],
     Machine = {module, ?MODULE, #{}},
     {ok, Started, []} = ra:start_cluster(?SYS, ClusterName, Machine, [A, B]),
     {ok, _, Leader} = ra:members(hd(Started)),
@@ -464,19 +464,19 @@ nonvoter_catches_up_after_leader_restart(Config) ->
      || N <- lists:seq(1, 10000)],
     {ok, _, _} = ra:process_command(Leader, banana),
 
-    New = #{id => C, voter => false},
-    {ok, _, _} = ra:add_member(A, New),
+    {ok, _, _} = ra:add_member(A, C),
     ok = ra:start_server(?SYS, ClusterName, C, Machine, [A, B]),
-    ?assertMatch({ok, #{cluster := #{C := #{voter_status := {nonvoter, _}}}}, _},
-                 ra:member_overview(A)),
+    ?assertMatch({ok, #{C := #{voter_status := {nonvoter, _}}}, _}, ra:cluster(C)),
+    ?assertMatch(#{known_non_voters := [C]}, rpc:call(ANode, ra, overview,[?SYS])),
     ok = ra:stop_server(?SYS, Leader),
     ok = ra:restart_server(?SYS, Leader),
 
     await_condition(
       fun () ->
-          {ok, #{cluster := #{C := Peer}}, _} = ra:member_overview(A),
-          voter == maps:get(voter_status, Peer)
+          {ok, #{C := #{voter_status := Voter}}, _} = ra:cluster(C),
+          voter =:= Voter
       end, 200),
+    ?assertMatch(#{known_non_voters := []}, rpc:call(ANode, ra, overview,[?SYS])),
 
     [ok = slave:stop(S) || {_, S} <- ServerIds],
     ok.
@@ -729,4 +729,15 @@ await_condition(Fun, Attempts) ->
         _ ->
             timer:sleep(100),
             await_condition(Fun, Attempts - 1)
+    end.
+
+fail_on_condition(_Fun, 0) ->
+    ok;
+fail_on_condition(Fun, Attempts) ->
+    case catch Fun() of
+        true -> 
+            exit(condition_materialised);
+        _ ->
+            timer:sleep(100),
+            fail_on_condition(Fun, Attempts - 1)
     end.

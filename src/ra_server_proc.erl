@@ -184,6 +184,7 @@ log_fold(ServerId, Fun, InitialState, Timeout) ->
                   all |
                   overview |
                   members |
+                  cluster |
                   initial_members |
                   machine, timeout()) ->
     ra_leader_call_ret(term()).
@@ -194,6 +195,7 @@ state_query(ServerLoc, Spec, Timeout) ->
                         all |
                         overview |
                         members |
+                        cluster |
                         initial_members |
                         machine, timeout()) ->
     ra_local_call_ret(term()).
@@ -1514,6 +1516,8 @@ do_state_query(machine, #{machine_state := MacState}) ->
     MacState;
 do_state_query(members, #{cluster := Cluster}) ->
     maps:keys(Cluster);
+do_state_query(cluster, #{cluster := Cluster}) ->
+    Cluster;
 do_state_query(initial_members, #{log := Log}) ->
     case ra_log:read_config(Log) of
         {ok, #{initial_members := InitialMembers}} ->
